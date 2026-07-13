@@ -76,6 +76,11 @@ namespace ams::mitm::ldn {
                         break;
                     }
                     std::scoped_lock lock(this->discovery->dataMutex);
+                    /* Drop our own advertisement echoed back by a relay. */
+                    if (this->selfIp != 0 && info->ldn.nodes[0].ipv4Address == this->selfIp) {
+                        LogFormat("ScanResp: ignoring our own network (echoed back by relay)");
+                        break;
+                    }
                     this->scanResults.insert({info->common.bssid, *info});
                     break;
                 }
@@ -133,6 +138,7 @@ namespace ams::mitm::ldn {
 
     void LDTcpSocket::onClose() {
         LogFormat("LDTcpSocket::onClose");
+        this->close();
         this->discovery->onDisconnectFromHost();
     }
 
@@ -187,6 +193,7 @@ namespace ams::mitm::ldn {
     void LANDiscovery::onDisconnectFromHost() {
         LogFormat("onDisconnectFromHost state: %d", static_cast<int>(this->state));
         if (this->state == CommState::StationConnected) {
+            this->disconnect_reason = DisconnectReason::SignalLost;
             this->setState(CommState::Station);
         }
     }
@@ -393,6 +400,12 @@ namespace ams::mitm::ldn {
         {
             std::scoped_lock lock(this->dataMutex);
             this->udp->scanResults.clear();
+            u32 myIp = 0;
+            if (R_SUCCEEDED(nifmGetCurrentIpAddress(&myIp))) {
+                this->udp->selfIp = ntohl(myIp);
+            } else {
+                this->udp->selfIp = 0;
+            }
         }
 
         /* Rebroadcast every 300ms; stop once results are stable for two checks. */
@@ -959,6 +972,7 @@ namespace ams::mitm::ldn {
         }
 
         originalMtu = networkProfile.ip_setting_data.mtu;
+        /* A low profile MTU breaks pia games (2618-0006). */
         int desiredMtu = originalMtu;
         if (desiredMtu == 0 || desiredMtu > 1500) {
             desiredMtu = 1500;

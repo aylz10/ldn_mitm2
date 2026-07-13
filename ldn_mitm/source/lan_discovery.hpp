@@ -93,6 +93,8 @@ namespace ams::mitm::ldn {
             LANDiscovery *discovery;
         public:
             std::unordered_map<MacAddress, NetworkInfo, MacHash> scanResults;
+            /* Guarded by discovery->dataMutex. */
+            u32 selfIp = 0;
         public:
             LDUdpSocket(int fd, LANDiscovery *discovery);
             int getFd() override {
