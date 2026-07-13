@@ -72,6 +72,7 @@ namespace ams::mitm::ldn {
 
             /*nyi----------------------------------------------------------------------------*/
             Result SetWirelessControllerRestriction();
+            Result SetProtocol(u32 protocol);
             Result Reject();
             Result AddAcceptFilterEntry();
             Result ClearAcceptFilter();

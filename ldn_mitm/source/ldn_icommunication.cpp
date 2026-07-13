@@ -207,6 +207,11 @@ namespace ams::mitm::ldn {
         return 0;
     }
 
+    Result ICommunicationService::SetProtocol(u32 protocol) {
+        LogFormat("SetProtocol %u", protocol);
+        return 0;
+    }
+
     Result ICommunicationService::Reject() {
         return 0;
     }
