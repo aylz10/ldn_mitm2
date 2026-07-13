@@ -1,6 +1,7 @@
 #include "lan_protocol.hpp"
 #include "debug.hpp"
 #include <poll.h>
+#include <cerrno>
 #include <memory>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -21,7 +22,10 @@ int Pollable::Poll(Pollable *fds[], size_t nfds, int timeout) {
     }
     int rc = poll(pfds, nfds, timeout);
     if (rc < 0) {
-        LogFormat("Pollable::Poll failed %d", rc);
+        if (errno == EINTR) {
+            return 0;
+        }
+        LogFormat("Pollable::Poll failed %d errno %d", rc, errno);
         return -1;
     }
     if (rc == 0) {
@@ -229,7 +233,7 @@ int LanSocket::compress(const void *input, size_t input_size, uint8_t *output, s
         uint8_t count = 0;
 
         if (c == 0) {
-            while (*in == 0 && in < in_end && count < 0xFF) {
+            while (in < in_end && *in == 0 && count < 0xFF) {
                 count += 1;
                 in++;
             }

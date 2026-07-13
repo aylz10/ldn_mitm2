@@ -1,8 +1,12 @@
 #include "lan_discovery.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <cerrno>
 #include "ipinfo.hpp"
 
 namespace ams::mitm::ldn {
@@ -28,6 +32,7 @@ namespace ams::mitm::ldn {
                     LogFormat("NodeInfo size is wrong");
                     return -1;
                 }
+                std::scoped_lock lock(this->discovery->dataMutex);
                 *this->nodeInfo = *info;
                 this->status = NodeStatus::Connected;
 
@@ -57,6 +62,7 @@ namespace ams::mitm::ldn {
             switch (type) {
                 case LANPacketType::Scan: {
                     if (this->discovery->getState() == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->discovery->dataMutex);
                         reply(LANPacketType::ScanResp, &this->discovery->networkInfo, sizeof(NetworkInfo));
                     }
                     break;
@@ -67,6 +73,7 @@ namespace ams::mitm::ldn {
                     if (size != sizeof(*info)) {
                         break;
                     }
+                    std::scoped_lock lock(this->discovery->dataMutex);
                     this->scanResults.insert({info->common.bssid, *info});
                     break;
                 }
@@ -141,6 +148,7 @@ namespace ams::mitm::ldn {
     }
 
     void LANDiscovery::onSyncNetwork(NetworkInfo *info) {
+        std::scoped_lock lock(this->dataMutex);
         this->networkInfo = *info;
         if (this->state == CommState::Station) {
             this->setState(CommState::StationConnected);
@@ -155,6 +163,9 @@ namespace ams::mitm::ldn {
             close(new_fd);
             return;
         }
+
+        /* Accepted sockets don't reliably inherit options from the listener. */
+        this->setSocketOpts(new_fd, true);
 
         bool found = false;
         for (auto &i : this->stations) {
@@ -190,6 +201,7 @@ namespace ams::mitm::ldn {
             return MAKERESULT(ModuleID, 10);
         }
 
+        std::scoped_lock lock(this->dataMutex);
         if (size > 0 && data != nullptr) {
             std::memcpy(this->networkInfo.ldn.advertiseData, data, size);
         } else {
@@ -235,10 +247,10 @@ namespace ams::mitm::ldn {
         return rc;
     }
 
-    Result LANDiscovery::setSocketOpts(int fd) {
+    Result LANDiscovery::setSocketOpts(int fd, bool isTcp) {
         int rc;
 
-        {
+        if (!isTcp) {
             int b = 1;
             rc = setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &b, sizeof(b));
             if (rc != 0) {
@@ -251,6 +263,18 @@ namespace ams::mitm::ldn {
             if (rc != 0) {
                 // return MAKERESULT(ModuleID, 5);
                 LogFormat("SO_REUSEADDR failed");
+            }
+        }
+        if (isTcp) {
+            int nodelay = 1;
+            rc = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            if (rc != 0) {
+                LogFormat("TCP_NODELAY failed");
+            }
+            struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+            rc = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (rc != 0) {
+                LogFormat("SO_SNDTIMEO failed");
             }
         }
 
@@ -272,9 +296,13 @@ namespace ams::mitm::ldn {
         }
         auto tcpSocket = std::make_unique<LDTcpSocket>(fd, this);
 
+        rc = setSocketOpts(fd, true);
+        if (R_FAILED(rc)) {
+            return rc;
+        }
         if (listening) {
             addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = htons(INADDR_ANY);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
             addr.sin_port = htons(listenPort);
             if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
                 return MAKERESULT(ModuleID, 7);
@@ -282,10 +310,6 @@ namespace ams::mitm::ldn {
             if (listen(fd, 10) != 0) {
                 return MAKERESULT(ModuleID, 8);
             }
-        }
-        rc = setSocketOpts(fd);
-        if (R_FAILED(rc)) {
-            return rc;
         }
 
         this->tcp = std::move(tcpSocket);
@@ -308,17 +332,17 @@ namespace ams::mitm::ldn {
         }
         auto udpSocket = std::make_unique<LDUdpSocket>(fd, this);
 
+        rc = setSocketOpts(fd, false);
+        if (R_FAILED(rc)) {
+            return rc;
+        }
         if (listening) {
             addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = htons(INADDR_ANY);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
             addr.sin_port = htons(listenPort);
             if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
                 return MAKERESULT(ModuleID, 2);
             }
-        }
-        rc = setSocketOpts(fd);
-        if (R_FAILED(rc)) {
-            return rc;
         }
 
         this->udp = std::move(udpSocket);
@@ -359,15 +383,41 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::scan(NetworkInfo *pOutNetwork, u16 *count, ScanFilter filter) {
-        this->udp->scanResults.clear();
-
-        int len = this->udp->sendBroadcast(LANPacketType::Scan);
-        if (len < 0) {
+        if (!this->initialized || !this->udp) {
+            *count = 0;
             return MAKERESULT(ModuleID, 20);
         }
 
-        svcSleepThread(1000000000L); // 1sec
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->udp->scanResults.clear();
+        }
 
+        /* Rebroadcast every 300ms; stop once results are stable for two checks. */
+        size_t lastCount = 0;
+        int stable = 0;
+        for (int j = 0; j < 10; j++) {
+            if (j % 3 == 0) {
+                int len = this->udp->sendBroadcast(LANPacketType::Scan);
+                if (len < 0 && j == 0) {
+                    return MAKERESULT(ModuleID, 20);
+                }
+            }
+            svcSleepThread(100000000L); // 100ms
+
+            std::scoped_lock lock(this->dataMutex);
+            const size_t cur = this->udp->scanResults.size();
+            if (cur > 0 && cur == lastCount) {
+                if (++stable >= 2) {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            lastCount = cur;
+        }
+
+        std::scoped_lock lock(this->dataMutex);
         int i = 0;
         for (auto& item : this->udp->scanResults) {
             if (i >= *count) {
@@ -421,6 +471,7 @@ namespace ams::mitm::ldn {
     }
 
     void LANDiscovery::updateNodes() {
+        std::scoped_lock lock(this->dataMutex);
         int count = 0;
         for (auto &i : this->stations) {
             bool connected = i.getStatus() == NodeStatus::Connected;
@@ -479,7 +530,8 @@ namespace ams::mitm::ldn {
             if (rc < 0) {
                 break;
             }
-            svcSleepThread(10000000L); // 10ms
+            /* Brief unlocked window so IPC threads can grab pollMutex. */
+            svcSleepThread(1000000L); // 1ms
         }
         LogFormat("Worker exit");
     }
@@ -488,6 +540,7 @@ namespace ams::mitm::ldn {
         Result rc = 0;
 
         if (this->state == CommState::AccessPointCreated || this->state == CommState::StationConnected) {
+            std::scoped_lock lock(this->dataMutex);
             std::memcpy(pOutNetwork, &networkInfo, sizeof(networkInfo));
         } else {
             rc = MAKERESULT(LdnModuleId, 32);
@@ -504,6 +557,7 @@ namespace ams::mitm::ldn {
         }
 
         if (this->state == CommState::AccessPointCreated || this->state == CommState::StationConnected) {
+            std::scoped_lock lock(this->dataMutex);
             std::memcpy(pOutNetwork, &networkInfo, sizeof(networkInfo));
 
             char str[10] = {0};
@@ -554,6 +608,9 @@ namespace ams::mitm::ldn {
         if (R_FAILED(rc)) {
             return rc;
         }
+
+        /* initTcp takes pollMutex, so it must run before dataMutex is taken. */
+        std::scoped_lock lock(this->dataMutex);
         rc = this->initNetworkInfo();
         if (R_FAILED(rc)) {
             return rc;
@@ -586,10 +643,13 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::destroyNetwork() {
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            this->resetStations();
         }
-        this->resetStations();
 
         this->setState(CommState::AccessPoint);
 
@@ -597,8 +657,11 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::disconnect() {
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
         }
         this->setState(CommState::Station);
 
@@ -611,10 +674,13 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            this->resetStations();
         }
-        this->resetStations();
 
         this->setState(CommState::AccessPoint);
 
@@ -626,10 +692,13 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            this->resetStations();
         }
-        this->resetStations();
 
         this->setState(CommState::Initialized);
 
@@ -642,10 +711,13 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            this->resetStations();
         }
-        this->resetStations();
 
         this->setState(CommState::Station);
 
@@ -657,10 +729,13 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
-        if (this->tcp) {
-            this->tcp->close();
+        {
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            this->resetStations();
         }
-        this->resetStations();
 
         this->setState(CommState::Initialized);
 
@@ -684,10 +759,32 @@ namespace ams::mitm::ldn {
             return rc;
         }
 
-        int ret = ::connect(this->tcp->getFd(), (struct sockaddr *)&addr, sizeof(addr));
+        const int fd = this->tcp->getFd();
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        int ret = ::connect(fd, (struct sockaddr *)&addr, sizeof(addr));
         if (ret != 0) {
-            LogFormat("connect failed");
-            return MAKERESULT(ModuleID, 31);
+            if (flags < 0 || errno != EINPROGRESS) {
+                LogFormat("connect failed");
+                return MAKERESULT(ModuleID, 31);
+            }
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            ret = poll(&pfd, 1, 5000);
+            if (ret <= 0) {
+                LogFormat("connect timeout");
+                return MAKERESULT(ModuleID, 31);
+            }
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) != 0 || err != 0) {
+                LogFormat("connect failed. SO_ERROR %d", err);
+                return MAKERESULT(ModuleID, 31);
+            }
+        }
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags);
         }
 
         NodeInfo myNode = {0};
@@ -700,9 +797,28 @@ namespace ams::mitm::ldn {
             LogFormat("sendPacket failed");
             return MAKERESULT(ModuleID, 32);
         }
-        this->initNodeStateChange();
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->initNodeStateChange();
+        }
 
-        svcSleepThread(1000000000L); // 1sec
+        bool synced = false;
+        for (int j = 0; j < 300; j++) {
+            if (this->state == CommState::StationConnected) {
+                synced = true;
+                break;
+            }
+            svcSleepThread(10000000L); // 10ms
+        }
+
+        if (!synced) {
+            LogFormat("connect: no SyncNetwork from host, aborting join");
+            std::scoped_lock lock(this->pollMutex);
+            if (this->tcp) {
+                this->tcp->close();
+            }
+            return MAKERESULT(ModuleID, 33);
+        }
 
         return 0;
     }
