@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <cerrno>
 #include "ipinfo.hpp"
+#include "nifm_manager.hpp"
 
 namespace ams::mitm::ldn {
 
@@ -950,6 +951,8 @@ namespace ams::mitm::ldn {
                     LogFormat("final nifmSetNetworkProfile failed: %x", rc);
                 }
             }
+
+            NifmSessionManager::Release();
         }
 
         this->setState(CommState::None);
@@ -963,8 +966,14 @@ namespace ams::mitm::ldn {
             return 0;
         }
 
+        Result rc = NifmSessionManager::Acquire();
+        if (R_FAILED(rc)) {
+            return rc;
+        }
+        auto nifmGuard = SCOPE_GUARD { NifmSessionManager::Release(); };
+
         NifmNetworkProfileData networkProfile;
-        Result rc = nifmGetCurrentNetworkProfile(&networkProfile);
+        rc = nifmGetCurrentNetworkProfile(&networkProfile);
         if (R_FAILED(rc))
         {
             LogFormat("nifmGetCurrentNetworkProfile failed: %x", rc);
@@ -1057,6 +1066,7 @@ namespace ams::mitm::ldn {
         this->setState(CommState::Initialized);
 
         this->initialized = true;
+        nifmGuard.Cancel();
         return 0;
     }
 }

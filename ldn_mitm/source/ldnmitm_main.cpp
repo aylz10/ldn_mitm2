@@ -216,7 +216,6 @@ namespace ams {
 
             /* Initialize other services. */
 
-            R_ABORT_UNLESS(nifmInitialize(NifmServiceType_Admin));
             R_ABORT_UNLESS(bsdInitialize(&LibnxBsdInitConfig, LibnxSocketInitConfig.num_bsd_sessions, LibnxSocketInitConfig.bsd_service_type));
             R_ABORT_UNLESS(socketInitialize(&LibnxSocketInitConfig));
         }

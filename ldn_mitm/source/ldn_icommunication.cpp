@@ -1,4 +1,5 @@
 #include "ldn_icommunication.hpp"
+#include "nifm_manager.hpp"
 #include <arpa/inet.h>
 
 namespace ams::mitm::ldn {
@@ -88,6 +89,12 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::GetIpv4Address(sf::Out<u32> address, sf::Out<u32> netmask) {
+        /* Callable before Initialize/after Finalize, when no nifm session is held. */
+        ScopedNifmSession session;
+        if (R_FAILED(session.GetResult())) {
+            return session.GetResult();
+        }
+
         u32 gateway, primary_dns, secondary_dns;
         Result rc = nifmGetCurrentIpConfigInfo(address.GetPointer(), netmask.GetPointer(), &gateway, &primary_dns, &secondary_dns);
 
