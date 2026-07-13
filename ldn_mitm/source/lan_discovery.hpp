@@ -165,8 +165,10 @@ namespace ams::mitm::ldn {
             Result scan(NetworkInfo *networkInfo, u16 *count, ScanFilter filter);
             Result setAdvertiseData(const u8 *data, uint16_t size);
             Result createNetwork(const SecurityConfig *securityConfig, const UserConfig *userConfig, const NetworkConfig *networkConfig);
+            Result createNetworkPrivate(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig);
             Result destroyNetwork();
             Result connect(const NetworkInfo *networkInfo, UserConfig *userConfig, u16 localCommunicationVersion);
+            Result connectPrivate(const SecurityParameterData *securityParameter, const UserConfig *userConfig, u16 localCommunicationVersion, const NetworkConfig *networkConfig);
             Result disconnect();
             Result getNetworkInfo(NetworkInfo *pOutNetwork);
             Result getNetworkInfo(NetworkInfo *pOutNetwork, NodeLatestUpdate *pOutUpdates, int bufferCount);
@@ -200,6 +202,7 @@ namespace ams::mitm::ldn {
             };
             int stationCount();
         protected:
+            Result createNetworkImpl(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig);
             Result setSocketOpts(int fd, bool isTcp);
             Result initTcp(bool listening);
             Result initUdp(bool listening);

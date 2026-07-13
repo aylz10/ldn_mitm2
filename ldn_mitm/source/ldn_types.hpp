@@ -151,6 +151,39 @@ namespace ams::mitm::ldn {
         SessionId sessionId;
     };
 
+    /* SecurityParameter as it appears in command raw data: same bytes, but
+       1-byte aligned so it can sit at offset 0x44 after SecurityConfig. */
+    struct SecurityParameterData {
+        uint8_t unkRandom[16];
+        uint8_t sessionId[16];
+    };
+
+    struct AddressEntry {
+        uint32_t ipv4Address;
+        MacAddress macAddress;
+        uint8_t _unk[2];
+    };
+
+    /* Raw layout of CreateNetworkPrivate (cmd 203). */
+    struct CreateNetworkPrivateConfig {
+        SecurityConfig securityConfig;              // 0x00
+        SecurityParameterData securityParameter;    // 0x44
+        UserConfig userConfig;                      // 0x64
+        uint8_t _unk[4];                            // 0x94
+        NetworkConfig networkConfig;                // 0x98
+    };                                              // 0xB8
+
+    /* Raw layout of ConnectPrivate (cmd 303). */
+    struct ConnectPrivateParam {
+        SecurityConfig securityConfig;              // 0x00
+        SecurityParameterData securityParameter;    // 0x44
+        UserConfig userConfig;                      // 0x64
+        uint32_t localCommunicationVersion;         // 0x94
+        uint32_t option;                            // 0x98
+        uint8_t _unk[4];                            // 0x9C
+        NetworkConfig networkConfig;                // 0xA0
+    };                                              // 0xC0
+
     struct ScanFilter {
         NetworkId networkId;
         uint32_t networkType;

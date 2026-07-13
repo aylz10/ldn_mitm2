@@ -66,15 +66,15 @@ namespace ams::mitm::ldn {
             Result Scan(sf::Out<u32> count, sf::OutAutoSelectArray<NetworkInfo> buffer, u16 channel, ScanFilter filter);
             Result Connect(ConnectNetworkData dat, const NetworkInfo &data);
             Result GetNetworkInfoLatestUpdate(sf::Out<NetworkInfo> buffer, sf::OutArray<NodeLatestUpdate> pUpdates);
+            Result ScanPrivate(sf::Out<u32> count, sf::OutAutoSelectArray<NetworkInfo> buffer, u16 channel, ScanFilter filter);
+            Result CreateNetworkPrivate(CreateNetworkPrivateConfig data, const sf::InPointerArray<AddressEntry> &entries);
+            Result ConnectPrivate(ConnectPrivateParam param);
 
             /*nyi----------------------------------------------------------------------------*/
             Result SetWirelessControllerRestriction();
-            Result ScanPrivate();
-            Result CreateNetworkPrivate();
             Result Reject();
             Result AddAcceptFilterEntry();
             Result ClearAcceptFilter();
-            Result ConnectPrivate();
             Result SetStationAcceptPolicy(u8 policy);
             Result InitializeSystem2(u64 unk, const sf::ClientProcessId &client_process_id);
             /*-------------------------------------------------------------------------------*/

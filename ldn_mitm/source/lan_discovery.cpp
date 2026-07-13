@@ -420,6 +420,12 @@ namespace ams::mitm::ldn {
         }
 
         std::scoped_lock lock(this->dataMutex);
+        LogFormat("scan filter flag %x comm %lx scene %d type %u session %lx.%lx ssid(%d) %.32s",
+            filter.flag,
+            filter.networkId.intentId.localCommunicationId, filter.networkId.intentId.sceneId,
+            filter.networkType,
+            filter.networkId.sessionId.high, filter.networkId.sessionId.low,
+            filter.ssid.length, filter.ssid.raw);
         int i = 0;
         for (auto& item : this->udp->scanResults) {
             if (i >= *count) {
@@ -444,6 +450,13 @@ namespace ams::mitm::ldn {
             if (filter.flag & ScanFilterFlag_SceneId) {
                 copy &= filter.networkId.intentId.sceneId == info.networkId.intentId.sceneId;
             }
+
+            LogFormat("scan cand comm %lx scene %d type %u session %lx.%lx ssid(%d) %.32s -> %d",
+                info.networkId.intentId.localCommunicationId, info.networkId.intentId.sceneId,
+                info.common.networkType,
+                info.networkId.sessionId.high, info.networkId.sessionId.low,
+                info.common.ssid.length, info.common.ssid.raw,
+                static_cast<int>(copy));
 
             if (copy) {
                 pOutNetwork[i++] = info;
@@ -598,6 +611,14 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::createNetwork(const SecurityConfig *securityConfig, const UserConfig *userConfig, const NetworkConfig *networkConfig) {
+        return this->createNetworkImpl(securityConfig, nullptr, userConfig, networkConfig);
+    }
+
+    Result LANDiscovery::createNetworkPrivate(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig) {
+        return this->createNetworkImpl(securityConfig, securityParameter, userConfig, networkConfig);
+    }
+
+    Result LANDiscovery::createNetworkImpl(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig) {
         LogFormat("SecurityConfig");
         LogHex(securityConfig->passphrase, securityConfig->passphraseSize);
         Result rc = 0;
@@ -626,8 +647,18 @@ namespace ams::mitm::ldn {
             this->networkInfo.common.channel = networkConfig->channel;
         }
 
-        ams::os::GenerateRandomBytes(&this->networkInfo.networkId.sessionId, sizeof(SessionId));
+        if (securityParameter != nullptr) {
+            /* The session id comes from the link code. */
+            std::memcpy(&this->networkInfo.networkId.sessionId, securityParameter->sessionId, sizeof(SessionId));
+            std::memcpy(this->networkInfo.ldn.unkRandom, securityParameter->unkRandom, sizeof(this->networkInfo.ldn.unkRandom));
+        } else {
+            ams::os::GenerateRandomBytes(&this->networkInfo.networkId.sessionId, sizeof(SessionId));
+        }
         this->networkInfo.networkId.intentId = networkConfig->intentId;
+        LogFormat("createNetwork comm %lx scene %d session %lx.%lx",
+            this->networkInfo.networkId.intentId.localCommunicationId,
+            this->networkInfo.networkId.intentId.sceneId,
+            this->networkInfo.networkId.sessionId.high, this->networkInfo.networkId.sessionId.low);
 
         NodeInfo *node0 = &this->networkInfo.ldn.nodes[0];
         rc = this->getNodeInfo(node0, userConfig, networkConfig->localCommunicationVersion);
@@ -823,6 +854,31 @@ namespace ams::mitm::ldn {
         }
 
         return 0;
+    }
+
+    Result LANDiscovery::connectPrivate(const SecurityParameterData *securityParameter, const UserConfig *userConfig, u16 localCommunicationVersion, const NetworkConfig *networkConfig) {
+        AMS_UNUSED(networkConfig);
+
+        /* ConnectPrivate gives no NetworkInfo: scan for the link code's session id. */
+        ScanFilter filter = {};
+        std::memcpy(&filter.networkId.sessionId, securityParameter->sessionId, sizeof(SessionId));
+        filter.flag = ScanFilterFlag_SessionId;
+
+        constexpr u16 ResultCountMax = 8;
+        auto results = std::make_unique<NetworkInfo[]>(ResultCountMax);
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            u16 count = ResultCountMax;
+            Result rc = this->scan(results.get(), &count, filter);
+            if (R_SUCCEEDED(rc) && count > 0) {
+                LogFormat("connectPrivate: found session on attempt %d", attempt);
+                UserConfig config = *userConfig;
+                return this->connect(&results[0], &config, localCommunicationVersion);
+            }
+        }
+
+        LogFormat("connectPrivate: no network with matching session id");
+        return ResultConnectFailed;
     }
 
     Result LANDiscovery::finalize() {

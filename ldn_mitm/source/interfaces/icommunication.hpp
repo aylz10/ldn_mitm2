@@ -15,12 +15,12 @@
         AMS_SF_METHOD_INFO(C, H, 100, Result, AttachStateChangeEvent,	          (ams::sf::Out<ams::sf::CopyHandle> handle), 																									(handle))							\
         AMS_SF_METHOD_INFO(C, H, 101, Result, GetNetworkInfoLatestUpdate,       (ams::sf::Out<ams::mitm::ldn::NetworkInfo> buffer, ams::sf::OutArray<ams::mitm::ldn::NodeLatestUpdate> pUpdates), 								(buffer, pUpdates))       			\
         AMS_SF_METHOD_INFO(C, H, 102, Result, Scan, 				   (ams::sf::Out<u32> count, ams::sf::OutAutoSelectArray<ams::mitm::ldn::NetworkInfo> buffer, u16 channel, ams::mitm::ldn::ScanFilter filter), 	(count, buffer, channel, filter))	\
- /*nyi*/AMS_SF_METHOD_INFO(C, H, 103, Result, ScanPrivate, 			   (), 																																			())									\
+        AMS_SF_METHOD_INFO(C, H, 103, Result, ScanPrivate, 			   (ams::sf::Out<u32> count, ams::sf::OutAutoSelectArray<ams::mitm::ldn::NetworkInfo> buffer, u16 channel, ams::mitm::ldn::ScanFilter filter), 	(count, buffer, channel, filter))	\
  /*nyi*/AMS_SF_METHOD_INFO(C, H, 104, Result, SetWirelessControllerRestriction, (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 200, Result, OpenAccessPoint, 		   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 201, Result, CloseAccessPoint, 		   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 202, Result, CreateNetwork, 			   (ams::mitm::ldn::CreateNetworkConfig data), 																									(data))								\
- /*nyi*/AMS_SF_METHOD_INFO(C, H, 203, Result, CreateNetworkPrivate, 		   (), 																																			())									\
+        AMS_SF_METHOD_INFO(C, H, 203, Result, CreateNetworkPrivate, 		   (ams::mitm::ldn::CreateNetworkPrivateConfig data, const ams::sf::InPointerArray<ams::mitm::ldn::AddressEntry> &entries), 						(data, entries))					\
         AMS_SF_METHOD_INFO(C, H, 204, Result, DestroyNetwork, 			   (), 																																			())									\
  /*nyi*/AMS_SF_METHOD_INFO(C, H, 205, Result, Reject, 				   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 206, Result, SetAdvertiseData, 		   (ams::sf::InAutoSelectBuffer data), 																											(data))								\
@@ -30,7 +30,7 @@
         AMS_SF_METHOD_INFO(C, H, 300, Result, OpenStation, 			   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 301, Result, CloseStation, 			   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 302, Result, Connect, 				   (ams::mitm::ldn::ConnectNetworkData dat, const ams::mitm::ldn::NetworkInfo &data), 																	(dat, data))						\
- /*nyi*/AMS_SF_METHOD_INFO(C, H, 303, Result, ConnectPrivate, 			   (), 																																			())									\
+        AMS_SF_METHOD_INFO(C, H, 303, Result, ConnectPrivate, 			   (ams::mitm::ldn::ConnectPrivateParam param), 																									(param))							\
         AMS_SF_METHOD_INFO(C, H, 304, Result, Disconnect, 			   (), 																																			())									\
         AMS_SF_METHOD_INFO(C, H, 400, Result, Initialize, 			   (const ams::sf::ClientProcessId &client_process_id), 																							(client_process_id))				\
         AMS_SF_METHOD_INFO(C, H, 401, Result, Finalize, 			   (), 																																			())									\
