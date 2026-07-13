@@ -781,6 +781,16 @@ namespace ams::mitm::ldn {
         }
 
         u32 hostIp = networkInfo->ldn.nodes[0].ipv4Address;
+
+        u32 myIp;
+        if (R_SUCCEEDED(nifmGetCurrentIpAddress(&myIp))) {
+            myIp = ntohl(myIp);
+            if (hostIp == myIp) {
+                LogFormat("connect: host IP %x equals our own; refusing self-connect", hostIp);
+                return ResultConnectFailed;
+            }
+        }
+
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(hostIp);
@@ -867,13 +877,27 @@ namespace ams::mitm::ldn {
         constexpr u16 ResultCountMax = 8;
         auto results = std::make_unique<NetworkInfo[]>(ResultCountMax);
 
+        u32 myIp = 0;
+        if (R_SUCCEEDED(nifmGetCurrentIpAddress(&myIp))) {
+            myIp = ntohl(myIp);
+        } else {
+            myIp = 0;
+        }
+
         for (int attempt = 0; attempt < 3; attempt++) {
             u16 count = ResultCountMax;
             Result rc = this->scan(results.get(), &count, filter);
-            if (R_SUCCEEDED(rc) && count > 0) {
-                LogFormat("connectPrivate: found session on attempt %d", attempt);
+            if (R_FAILED(rc)) {
+                continue;
+            }
+            for (u16 j = 0; j < count; j++) {
+                if (myIp != 0 && results[j].ldn.nodes[0].ipv4Address == myIp) {
+                    LogFormat("connectPrivate: skipping self result %x", myIp);
+                    continue;
+                }
+                LogFormat("connectPrivate: found session on attempt %d idx %d", attempt, j);
                 UserConfig config = *userConfig;
-                return this->connect(&results[0], &config, localCommunicationVersion);
+                return this->connect(&results[j], &config, localCommunicationVersion);
             }
         }
 
@@ -898,18 +922,20 @@ namespace ams::mitm::ldn {
             {
                 LogFormat("final nifmRequestCancel failed: %x", rc);
             }
+            /* Close frees the request session; Cancel alone leaks it. */
+            nifmRequestClose(&request);
 
             NifmNetworkProfileData networkProfile;
             rc = nifmGetCurrentNetworkProfile(&networkProfile);
             if (R_FAILED(rc))
             {
                 LogFormat("final nifmGetCurrentProfile failed: %x", rc);
-            }
-
-            networkProfile.ip_setting_data.mtu = originalMtu;
-            rc = nifmSetNetworkProfile(&networkProfile, &networkProfile.uuid);
-            if (R_FAILED(rc)) {
-                LogFormat("final nifmSetNetworkProfile failed: %x", rc);
+            } else if (networkProfile.ip_setting_data.mtu != originalMtu) {
+                networkProfile.ip_setting_data.mtu = originalMtu;
+                rc = nifmSetNetworkProfile(&networkProfile, &networkProfile.uuid);
+                if (R_FAILED(rc)) {
+                    LogFormat("final nifmSetNetworkProfile failed: %x", rc);
+                }
             }
         }
 
@@ -933,25 +959,47 @@ namespace ams::mitm::ldn {
         }
 
         originalMtu = networkProfile.ip_setting_data.mtu;
-        networkProfile.ip_setting_data.mtu = 1500;
-
-        rc = nifmSetNetworkProfile(&networkProfile, &networkProfile.uuid);
-        if (R_FAILED(rc))
-        {
-            LogFormat("nifmSetNetworkProfile failed: %x", rc);
-            return rc;
+        int desiredMtu = originalMtu;
+        if (desiredMtu == 0 || desiredMtu > 1500) {
+            desiredMtu = 1500;
         }
+
+        bool mtuChanged = false;
+        if (desiredMtu != originalMtu) {
+            networkProfile.ip_setting_data.mtu = desiredMtu;
+            rc = nifmSetNetworkProfile(&networkProfile, &networkProfile.uuid);
+            if (R_FAILED(rc)) {
+                LogFormat("nifmSetNetworkProfile failed: %x", rc);
+                return rc;
+            }
+            mtuChanged = true;
+        }
+
+        auto restoreMtu = [&]() {
+            if (!mtuChanged) {
+                return;
+            }
+            NifmNetworkProfileData p;
+            if (R_SUCCEEDED(nifmGetCurrentNetworkProfile(&p))) {
+                p.ip_setting_data.mtu = originalMtu;
+                nifmSetNetworkProfile(&p, &p.uuid);
+            }
+        };
 
         rc = nifmCreateRequest(&request, true);
         if (R_FAILED(rc))
         {
             LogFormat("nifmCreateRequest failed: %x", rc);
+            restoreMtu();
             return rc;
         }
 
         rc = nifmSetLocalNetworkMode(&request, true);
         if (R_FAILED(rc)) {
             LogFormat("nifmSetLocalNetworkMode failed %x", rc);
+            nifmRequestCancel(&request);
+            nifmRequestClose(&request);
+            restoreMtu();
             return rc;
         }
 
@@ -959,6 +1007,9 @@ namespace ams::mitm::ldn {
         if (R_FAILED(rc))
         {
             LogFormat("nifmRequestSubmitAndWait failed: %x", rc);
+            nifmRequestCancel(&request);
+            nifmRequestClose(&request);
+            restoreMtu();
             return rc;
         }
 
@@ -972,12 +1023,19 @@ namespace ams::mitm::ldn {
         rc = this->initUdp(listening);
         if (R_FAILED(rc)) {
             LogFormat("initUdp %x", rc);
+            nifmRequestCancel(&request);
+            nifmRequestClose(&request);
+            restoreMtu();
             return rc;
         }
 
         rc = os::CreateThread(&this->workerThread, &Worker, this, reinterpret_cast<void *>(util::AlignUp(reinterpret_cast<uintptr_t>(stack.get()), os::ThreadStackAlignment)), StackSize, 0x15, 2);
         if (R_FAILED(rc)) {
             LogFormat("LANDiscovery Failed to threadCreate: %x", rc);
+            this->udp.reset();
+            nifmRequestCancel(&request);
+            nifmRequestClose(&request);
+            restoreMtu();
             return 0xF601;
         }
 
