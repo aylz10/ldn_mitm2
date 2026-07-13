@@ -9,7 +9,7 @@ The original ldn service is only responsible for calling the WiFi service to sca
 
 ## Version table
 
-Please try the [GHA nightlies](https://github.com/spacemeowx2/ldn_mitm/actions) if you have updated beyond the supported AMS versions.
+Please try the [GHA nightlies](https://github.com/dogty/ldn_mitm/actions/workflows/nightly.yml) (or the [latest build artifacts](https://github.com/dogty/ldn_mitm/actions/workflows/build.yml)) if you have updated beyond the supported AMS versions.
 | ldn_mitm version | Atmosphère version |
 | :--------------: | :----------------: |
 | [1.25.1](https://github.com/spacemeowx2/ldn_mitm/releases/tag/v1.25.1)            | [1.11.1](https://github.com/Atmosphere-NX/Atmosphere/releases/tag/1.11.1)
