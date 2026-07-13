@@ -13,6 +13,8 @@ namespace ams::mitm::ldn {
 
     static const int ModuleID = 0xFD;
     static const int LdnModuleId = 0xCB;
+    /* nn::ldn ConnectFailed (2203-0064). */
+    static const Result ResultConnectFailed = MAKERESULT(0xCB, 64);
 
     const char *LANDiscovery::FakeSsid = "12345678123456781234567812345678";
     const LANDiscovery::LanEventFunc LANDiscovery::EmptyFunc = [](){};
@@ -768,19 +770,19 @@ namespace ams::mitm::ldn {
         if (ret != 0) {
             if (flags < 0 || errno != EINPROGRESS) {
                 LogFormat("connect failed");
-                return MAKERESULT(ModuleID, 31);
+                return ResultConnectFailed;
             }
             struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
             ret = poll(&pfd, 1, 5000);
             if (ret <= 0) {
                 LogFormat("connect timeout");
-                return MAKERESULT(ModuleID, 31);
+                return ResultConnectFailed;
             }
             int err = 0;
             socklen_t errlen = sizeof(err);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) != 0 || err != 0) {
                 LogFormat("connect failed. SO_ERROR %d", err);
-                return MAKERESULT(ModuleID, 31);
+                return ResultConnectFailed;
             }
         }
         if (flags >= 0) {
@@ -795,7 +797,7 @@ namespace ams::mitm::ldn {
         ret = this->tcp->sendPacket(LANPacketType::Connect, &myNode, sizeof(myNode));
         if (ret < 0) {
             LogFormat("sendPacket failed");
-            return MAKERESULT(ModuleID, 32);
+            return ResultConnectFailed;
         }
         {
             std::scoped_lock lock(this->dataMutex);
@@ -817,7 +819,7 @@ namespace ams::mitm::ldn {
             if (this->tcp) {
                 this->tcp->close();
             }
-            return MAKERESULT(ModuleID, 33);
+            return ResultConnectFailed;
         }
 
         return 0;
