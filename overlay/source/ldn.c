@@ -33,6 +33,14 @@ Result ldnMitmSetEnabled(LdnMitmConfigService *s, u32 enabled) {
     return serviceDispatchIn(&s->s, 65005, enabled);
 }
 
+Result ldnMitmGetBroadcastRelay(LdnMitmConfigService *s, u32 *enabled) {
+    return serviceDispatchOut(&s->s, 65006, *enabled);
+}
+
+Result ldnMitmSetBroadcastRelay(LdnMitmConfigService *s, u32 enabled) {
+    return serviceDispatchIn(&s->s, 65007, enabled);
+}
+
 Result ldnMitmGetVersion(LdnMitmConfigService *s, char *version) {
     char version_s[32];
     Result rc = serviceDispatchOut(&s->s, 65001, version_s);

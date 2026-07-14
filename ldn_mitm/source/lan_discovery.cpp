@@ -9,6 +9,7 @@
 #include <cerrno>
 #include "ipinfo.hpp"
 #include "nifm_manager.hpp"
+#include "session_registry.hpp"
 
 namespace ams::mitm::ldn {
 
@@ -163,6 +164,8 @@ namespace ams::mitm::ldn {
             this->setState(CommState::StationConnected);
         }
         this->onNetworkInfoChanged();
+
+        this->publishSessionRegistry();
     }
 
     void LANDiscovery::onConnect(int new_fd) {
@@ -521,6 +524,32 @@ namespace ams::mitm::ldn {
         }
 
         this->onNetworkInfoChanged();
+
+        this->publishSessionRegistry();
+    }
+
+    void LANDiscovery::publishSessionRegistry() {
+        u32 address = 0, netmask = 0, gateway, primary_dns, secondary_dns;
+        if (R_FAILED(nifmGetCurrentIpConfigInfo(&address, &netmask, &gateway, &primary_dns, &secondary_dns))) {
+            return;
+        }
+        const u32 self_ip = ntohl(address);
+        const u32 bcast_ip = self_ip | ~ntohl(netmask);
+
+        u32 peers[SessionRegistry::MaxPeers];
+        int count = 0;
+        const int node_count = this->networkInfo.ldn.nodeCount;
+        for (int i = 0; i < node_count && i < NodeCountMax; i++) {
+            const u32 ip = this->networkInfo.ldn.nodes[i].ipv4Address;
+            if (ip == 0 || ip == self_ip) {
+                continue;
+            }
+            if (count < SessionRegistry::MaxPeers) {
+                peers[count++] = ip;
+            }
+        }
+
+        SessionRegistry::Publish(bcast_ip, peers, count);
     }
 
     int LANDiscovery::loopPoll() {
@@ -690,6 +719,7 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::destroyNetwork() {
+        SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
             if (this->tcp) {
@@ -704,6 +734,7 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::disconnect() {
+        SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
             if (this->tcp) {
@@ -739,6 +770,7 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
+        SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
             if (this->tcp) {
@@ -776,6 +808,7 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
+        SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
             if (this->tcp) {
@@ -923,6 +956,7 @@ namespace ams::mitm::ldn {
         Result rc = 0;
 
         if (this->initialized) {
+            SessionRegistry::Clear();
             this->stop = true;
             os::WaitThread(&this->workerThread);
             os::DestroyThread(&this->workerThread);

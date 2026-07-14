@@ -155,6 +155,8 @@ namespace ams::mitm::ldn {
             void onNetworkInfoChanged();
 
             void updateNodes();
+            /* Call with dataMutex held. */
+            void publishSessionRegistry();
             void resetStations();
             Result getFakeMac(MacAddress *mac);
             Result getNodeInfo(NodeInfo *node, const UserConfig *userConfig, u16 localCommunicationVersion);

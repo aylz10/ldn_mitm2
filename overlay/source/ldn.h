@@ -15,6 +15,8 @@ Result ldnMitmGetLogging(LdnMitmConfigService *s, u32 *enabled);
 Result ldnMitmSetLogging(LdnMitmConfigService *s, u32 enabled);
 Result ldnMitmGetEnabled(LdnMitmConfigService *s, u32 *enabled);
 Result ldnMitmSetEnabled(LdnMitmConfigService *s, u32 enabled);
+Result ldnMitmGetBroadcastRelay(LdnMitmConfigService *s, u32 *enabled);
+Result ldnMitmSetBroadcastRelay(LdnMitmConfigService *s, u32 enabled);
 Result ldnMitmGetConfig(LdnMitmConfigService *out);
 Result ldnMitmGetConfigFromService(Service* s, LdnMitmConfigService *out);
 

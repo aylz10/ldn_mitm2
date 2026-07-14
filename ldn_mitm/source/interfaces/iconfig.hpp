@@ -14,6 +14,8 @@ namespace ams::mitm::ldn {
     AMS_SF_METHOD_INFO(C, H, 65002, Result, GetLogging, 	(ams::sf::Out<u32> enabled), 							(enabled))	\
     AMS_SF_METHOD_INFO(C, H, 65003, Result, SetLogging, 	(u32 enabled), 											(enabled))	\
     AMS_SF_METHOD_INFO(C, H, 65004, Result, GetEnabled, 	(ams::sf::Out<u32> enabled), 							(enabled))	\
-    AMS_SF_METHOD_INFO(C, H, 65005, Result, SetEnabled, 	(u32 enabled), 											(enabled))
+    AMS_SF_METHOD_INFO(C, H, 65005, Result, SetEnabled, 	(u32 enabled), 											(enabled))	\
+    AMS_SF_METHOD_INFO(C, H, 65006, Result, GetBroadcastRelay, 	(ams::sf::Out<u32> enabled), 						(enabled))	\
+    AMS_SF_METHOD_INFO(C, H, 65007, Result, SetBroadcastRelay, 	(u32 enabled), 										(enabled))
 
     AMS_SF_DEFINE_INTERFACE(ams::mitm::ldn, ILdnConfig, AMS_LDN_CONFIG, 0x14c8af2c)

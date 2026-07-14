@@ -4,6 +4,7 @@
 
 namespace ams::mitm::ldn {
     std::atomic_bool LdnConfig::LdnEnabled = true;
+    std::atomic_bool LdnConfig::BroadcastRelay = true;
 
     Result LdnConfig::GetVersion(sf::Out<LdnMitmVersion> version) {
         std::strcpy(version.GetPointer()->raw, GITDESCVER);
@@ -23,7 +24,17 @@ namespace ams::mitm::ldn {
     }
     Result LdnConfig::SetEnabled(u32 enabled) {
         LdnEnabled = enabled;
-        
+
+        R_SUCCEED();
+    }
+    Result LdnConfig::GetBroadcastRelay(sf::Out<u32> enabled) {
+        enabled.SetValue(BroadcastRelay);
+
+        R_SUCCEED();
+    }
+    Result LdnConfig::SetBroadcastRelay(u32 enabled) {
+        BroadcastRelay = enabled;
+
         R_SUCCEED();
     }
 }
