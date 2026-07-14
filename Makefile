@@ -11,10 +11,24 @@ NRO_DIR     :=  $(SD_ROOT)/switch/ldnmitm_config
 TITLE_DIR   :=  $(SD_ROOT)/atmosphere/contents/4200000000000010
 OVERLAY_DIR :=  $(SD_ROOT)/switch/.overlays
 
+ATMOSPHERE_PATCH := docs/atmosphere-libs-mitm-domain-id-collision.patch
+
 $(TOPTARGETS): PACK
 
 $(SUBFOLDERS):
 	$(MAKE) -C $@ $(MAKECMDGOALS)
+
+atmosphere-patch:
+	@ if git -C Atmosphere-libs apply --check -R ../$(ATMOSPHERE_PATCH) 2>/dev/null; then \
+		echo "Atmosphere-libs patch already applied"; \
+	else \
+		echo "Applying $(ATMOSPHERE_PATCH)"; \
+		git -C Atmosphere-libs apply ../$(ATMOSPHERE_PATCH); \
+	fi
+
+ifeq (,$(filter clean,$(MAKECMDGOALS)))
+Atmosphere-libs/libstratosphere: atmosphere-patch
+endif
 
 $(KIPS): Atmosphere-libs/libstratosphere
 

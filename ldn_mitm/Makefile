@@ -6,7 +6,8 @@ include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../Atmosphere-libs/config
 #---------------------------------------------------------------------------------
 # version control constants
 #---------------------------------------------------------------------------------
-TARGET_VERSION := $(shell git describe --tags --dirty)
+# Ignore submodules for -dirty: Atmosphere-libs carries the docs/ patch.
+TARGET_VERSION := $(shell git describe --tags)$(shell git diff --quiet --ignore-submodules=all HEAD 2>/dev/null || echo -dirty)
 
 #---------------------------------------------------------------------------------
 # options for code generation

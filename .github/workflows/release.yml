@@ -27,6 +27,9 @@ jobs:
       with:
         submodules: true
 
+    - name: Apply Atmosphere-libs patches
+      run: git -C Atmosphere-libs apply ../docs/atmosphere-libs-mitm-domain-id-collision.patch
+
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
 

@@ -30,7 +30,10 @@ jobs:
           git fetch --all
           git reset --hard origin/master
           popd
-      
+
+      - name: Apply Atmosphere-libs patches
+        run: git -C Atmosphere-libs apply ../docs/atmosphere-libs-mitm-domain-id-collision.patch
+
       - name: Build
         id: build
         run: make -j8 PREFIX="ccache aarch64-none-elf-"

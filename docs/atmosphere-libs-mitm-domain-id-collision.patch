@@ -1,0 +1,313 @@
+diff --git a/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_api.hpp b/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_api.hpp
+index de84497..e0cc41e 100644
+--- a/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_api.hpp
++++ b/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_api.hpp
+@@ -58,6 +58,7 @@ namespace ams::sf::cmif {
+         public:
+             virtual Result ReserveIds(DomainObjectId *out_ids, size_t count) = 0;
+             virtual void   ReserveSpecificIds(const DomainObjectId *ids, size_t count) = 0;
++            virtual bool   TryRegisterMirroredObject(DomainObjectId id, ServiceObjectHolder &&obj) = 0;
+             virtual void   UnreserveIds(const DomainObjectId *ids, size_t count) = 0;
+             virtual void   RegisterObject(DomainObjectId id, ServiceObjectHolder &&obj) = 0;
+ 
+diff --git a/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_manager.hpp b/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_manager.hpp
+index 287fd40..4a1db50 100644
+--- a/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_manager.hpp
++++ b/libstratosphere/include/stratosphere/sf/cmif/sf_cmif_domain_manager.hpp
+@@ -35,9 +35,16 @@ namespace ams::sf::cmif {
+                 util::IntrusiveListNode free_list_node;
+                 util::IntrusiveListNode domain_list_node;
+                 Domain *owner;
++                /* The id this entry answers to, scoped to its domain. Ids are
++                   only meaningful within one domain: a mitm domain mirrors the
++                   target server's per-session ids, so the same value can
++                   legitimately be live in several domains at once. Entries are
++                   therefore looked up by scanning the owning domain's lists,
++                   never by a manager-global index. */
++                DomainObjectId id;
+                 ServiceObjectHolder object;
+ 
+-                explicit Entry() : owner(nullptr) { /* ... */ }
++                explicit Entry() : owner(nullptr), id(InvalidDomainObjectId) { /* ... */ }
+             };
+ 
+             class Domain final : public DomainServiceObject, private sf::impl::ServiceObjectImplBase2 {
+@@ -48,6 +55,12 @@ namespace ams::sf::cmif {
+                 private:
+                     ServerDomainManager *m_manager;
+                     EntryList m_entries;
++                    /* Entries with an id assigned (ReserveIds/ReserveSpecificIds)
++                       that have not been registered yet. */
++                    EntryList m_reserved;
++                private:
++                    /* Requires m_manager->m_entry_owner_lock held. */
++                    Entry *FindEntryLocked(DomainObjectId id);
+                 public:
+                     explicit Domain(ServerDomainManager *m) : m_manager(m) { /* ... */ }
+                     ~Domain();
+@@ -70,6 +83,7 @@ namespace ams::sf::cmif {
+ 
+                     virtual Result ReserveIds(DomainObjectId *out_ids, size_t count) override final;
+                     virtual void   ReserveSpecificIds(const DomainObjectId *ids, size_t count) override final;
++                    virtual bool   TryRegisterMirroredObject(DomainObjectId id, ServiceObjectHolder &&obj) override final;
+                     virtual void   UnreserveIds(const DomainObjectId *ids, size_t count) override final;
+                     virtual void   RegisterObject(DomainObjectId id, ServiceObjectHolder &&obj) override final;
+ 
+@@ -94,33 +108,19 @@ namespace ams::sf::cmif {
+                     Entry *AllocateEntry();
+                     void   FreeEntry(Entry *);
+ 
+-                    void AllocateSpecificEntries(const DomainObjectId *ids, size_t count);
+-
+-                    inline DomainObjectId GetId(Entry *e) {
+-                        const size_t index = e - m_entries;
+-                        AMS_ABORT_UNLESS(index < m_num_entries);
+-                        return DomainObjectId{ u32(index + 1) };
+-                    }
+-
+-                    inline Entry *GetEntry(DomainObjectId id) {
+-                        if (id == InvalidDomainObjectId) {
+-                            return nullptr;
+-                        }
+-                        const size_t index = id.value - 1;
+-                        if (!(index < m_num_entries)) {
+-                            return nullptr;
+-                        }
+-                        return m_entries + index;
+-                    }
+             };
+         private:
+             os::SdkMutex m_entry_owner_lock;
+             EntryManager m_entry_manager;
++            /* Source of generated (non-mirrored) object ids. Guarded by
++               m_entry_owner_lock. Monotonic, so a generated id can never
++               accidentally equal another generated id in any domain. */
++            u32 m_next_object_id;
+         private:
+             virtual void *AllocateDomain()   = 0;
+             virtual void  FreeDomain(void *) = 0;
+         protected:
+-            ServerDomainManager(DomainEntryStorage *entry_storage, size_t entry_count) : m_entry_owner_lock(), m_entry_manager(entry_storage, entry_count) { /* ... */ }
++            ServerDomainManager(DomainEntryStorage *entry_storage, size_t entry_count) : m_entry_owner_lock(), m_entry_manager(entry_storage, entry_count), m_next_object_id(1) { /* ... */ }
+ 
+             inline DomainServiceObject *AllocateDomainServiceObject() {
+                 void *storage = this->AllocateDomain();
+diff --git a/libstratosphere/source/sf/cmif/sf_cmif_domain_manager.cpp b/libstratosphere/source/sf/cmif/sf_cmif_domain_manager.cpp
+index 2ad6958..87ae3d5 100644
+--- a/libstratosphere/source/sf/cmif/sf_cmif_domain_manager.cpp
++++ b/libstratosphere/source/sf/cmif/sf_cmif_domain_manager.cpp
+@@ -24,11 +24,18 @@ namespace ams::sf::cmif {
+                 std::scoped_lock lk(m_manager->m_entry_owner_lock);
+                 AMS_ABORT_UNLESS(entry->owner == this);
+                 entry->owner = nullptr;
++                entry->id    = InvalidDomainObjectId;
+             }
+             entry->object.Reset();
+             m_entries.pop_front();
+             m_manager->m_entry_manager.FreeEntry(entry);
+         }
++        while (!m_reserved.empty()) {
++            Entry *entry = std::addressof(m_reserved.front());
++            m_reserved.pop_front();
++            entry->id = InvalidDomainObjectId;
++            m_manager->m_entry_manager.FreeEntry(entry);
++        }
+     }
+ 
+     void ServerDomainManager::Domain::DisposeImpl() {
+@@ -37,53 +44,119 @@ namespace ams::sf::cmif {
+         manager->FreeDomain(this);
+     }
+ 
++    ServerDomainManager::Entry *ServerDomainManager::Domain::FindEntryLocked(DomainObjectId id) {
++        if (id == InvalidDomainObjectId) {
++            return nullptr;
++        }
++        for (Entry &entry : m_entries) {
++            if (entry.id == id) {
++                return std::addressof(entry);
++            }
++        }
++        for (Entry &entry : m_reserved) {
++            if (entry.id == id) {
++                return std::addressof(entry);
++            }
++        }
++        return nullptr;
++    }
++
+     Result ServerDomainManager::Domain::ReserveIds(DomainObjectId *out_ids, size_t count) {
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
+         for (size_t i = 0; i < count; i++) {
+             Entry *entry = m_manager->m_entry_manager.AllocateEntry();
+             R_UNLESS(entry != nullptr, sf::cmif::ResultOutOfDomainEntries());
+             AMS_ABORT_UNLESS(entry->owner == nullptr);
+-            out_ids[i] = m_manager->m_entry_manager.GetId(entry);
++
++            /* Generate an id this domain doesn't use yet. The counter makes
++               generated ids unique manager-wide; the scan additionally skips
++               values a mirrored (mitm) object may already occupy here. */
++            DomainObjectId id;
++            do {
++                id = DomainObjectId{m_manager->m_next_object_id++};
++            } while (id == InvalidDomainObjectId || this->FindEntryLocked(id) != nullptr);
++
++            entry->id = id;
++            m_reserved.push_back(*entry);
++            out_ids[i] = id;
+         }
+         R_SUCCEED();
+     }
+ 
+     void ServerDomainManager::Domain::ReserveSpecificIds(const DomainObjectId *ids, size_t count) {
+-        m_manager->m_entry_manager.AllocateSpecificEntries(ids, count);
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
++        for (size_t i = 0; i < count; i++) {
++            const auto id = ids[i];
++            if (id == InvalidDomainObjectId) {
++                continue;
++            }
++
++            /* A duplicate id within one domain is a genuine desynchronization
++               from the mitm target. */
++            AMS_ABORT_UNLESS(this->FindEntryLocked(id) == nullptr);
++
++            Entry *entry = m_manager->m_entry_manager.AllocateEntry();
++            AMS_ABORT_UNLESS(entry != nullptr);
++            entry->id = id;
++            m_reserved.push_back(*entry);
++        }
++    }
++
++    bool ServerDomainManager::Domain::TryRegisterMirroredObject(DomainObjectId id, ServiceObjectHolder &&obj) {
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
++
++        /* Refuse (rather than abort) on a duplicate or exhaustion; the caller
++           falls back to serving the session as a pure forwarder. */
++        if (id == InvalidDomainObjectId || this->FindEntryLocked(id) != nullptr) {
++            return false;
++        }
++
++        Entry *entry = m_manager->m_entry_manager.AllocateEntry();
++        if (entry == nullptr) {
++            return false;
++        }
++
++        entry->id    = id;
++        entry->owner = this;
++        m_entries.push_back(*entry);
++        entry->object = std::move(obj);
++        return true;
+     }
+ 
+     void ServerDomainManager::Domain::UnreserveIds(const DomainObjectId *ids, size_t count) {
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
+         for (size_t i = 0; i < count; i++) {
+-            Entry *entry = m_manager->m_entry_manager.GetEntry(ids[i]);
++            Entry *entry = this->FindEntryLocked(ids[i]);
+             AMS_ABORT_UNLESS(entry != nullptr);
+             AMS_ABORT_UNLESS(entry->owner == nullptr);
++            m_reserved.erase(m_reserved.iterator_to(*entry));
++            entry->id = InvalidDomainObjectId;
+             m_manager->m_entry_manager.FreeEntry(entry);
+         }
+     }
+ 
+     void ServerDomainManager::Domain::RegisterObject(DomainObjectId id, ServiceObjectHolder &&obj) {
+-        Entry *entry = m_manager->m_entry_manager.GetEntry(id);
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
++        Entry *entry = this->FindEntryLocked(id);
+         AMS_ABORT_UNLESS(entry != nullptr);
+-        {
+-            std::scoped_lock lk(m_manager->m_entry_owner_lock);
+-            AMS_ABORT_UNLESS(entry->owner == nullptr);
+-            entry->owner = this;
+-            m_entries.push_back(*entry);
+-        }
++        AMS_ABORT_UNLESS(entry->owner == nullptr);
++        m_reserved.erase(m_reserved.iterator_to(*entry));
++        entry->owner = this;
++        m_entries.push_back(*entry);
+         entry->object = std::move(obj);
+     }
+ 
+     ServiceObjectHolder ServerDomainManager::Domain::UnregisterObject(DomainObjectId id) {
+         ServiceObjectHolder obj;
+-        Entry *entry = m_manager->m_entry_manager.GetEntry(id);
+-        if (entry == nullptr) {
+-            return ServiceObjectHolder();
+-        }
++        Entry *entry;
+         {
+             std::scoped_lock lk(m_manager->m_entry_owner_lock);
+-            if (entry->owner != this) {
++            entry = this->FindEntryLocked(id);
++            if (entry == nullptr || entry->owner != this) {
+                 return ServiceObjectHolder();
+             }
+             entry->owner = nullptr;
++            entry->id    = InvalidDomainObjectId;
+             obj = std::move(entry->object);
+             m_entries.erase(m_entries.iterator_to(*entry));
+         }
+@@ -92,17 +165,11 @@ namespace ams::sf::cmif {
+     }
+ 
+     ServiceObjectHolder ServerDomainManager::Domain::GetObject(DomainObjectId id) {
+-        Entry *entry = m_manager->m_entry_manager.GetEntry(id);
+-        if (entry == nullptr) {
++        std::scoped_lock lk(m_manager->m_entry_owner_lock);
++        Entry *entry = this->FindEntryLocked(id);
++        if (entry == nullptr || entry->owner != this) {
+             return ServiceObjectHolder();
+         }
+-
+-        {
+-            std::scoped_lock lk(m_manager->m_entry_owner_lock);
+-            if (entry->owner != this) {
+-                return ServiceObjectHolder();
+-            }
+-        }
+         return entry->object.Clone();
+     }
+ 
+@@ -139,19 +206,4 @@ namespace ams::sf::cmif {
+         m_free_list.push_front(*entry);
+     }
+ 
+-    void ServerDomainManager::EntryManager::AllocateSpecificEntries(const DomainObjectId *ids, size_t count) {
+-        std::scoped_lock lk(m_lock);
+-
+-        /* Allocate new IDs. */
+-        for (size_t i = 0; i < count; i++) {
+-            const auto id = ids[i];
+-            Entry *entry = this->GetEntry(id);
+-            if (id != InvalidDomainObjectId) {
+-                AMS_ABORT_UNLESS(entry != nullptr);
+-                AMS_ABORT_UNLESS(entry->owner == nullptr);
+-                m_free_list.erase(m_free_list.iterator_to(*entry));
+-            }
+-        }
+-    }
+-
+ }
+diff --git a/libstratosphere/source/sf/hipc/sf_hipc_server_domain_session_manager.cpp b/libstratosphere/source/sf/hipc/sf_hipc_server_domain_session_manager.cpp
+index c1e6bdb..881944d 100644
+--- a/libstratosphere/source/sf/hipc/sf_hipc_server_domain_session_manager.cpp
++++ b/libstratosphere/source/sf/hipc/sf_hipc_server_domain_session_manager.cpp
+@@ -84,12 +84,10 @@ namespace ams::sf::hipc {
+                         AMS_ABORT_UNLESS(util::GetReference(m_session->m_forward_service)->own_handle);
+                         R_TRY(serviceConvertToDomain(util::GetReference(m_session->m_forward_service).get()));
+ 
+-                        /* The object ID reservation cannot fail here, as that would cause desynchronization from target domain. */
++                        /* Mirror the target's object id. On failure, leave no local
++                           object so every request is forwarded verbatim. */
+                         object_id = cmif::DomainObjectId{util::GetReference(m_session->m_forward_service)->object_id};
+-                        domain->ReserveSpecificIds(std::addressof(object_id), 1);
+-
+-                        /* Register the object. */
+-                        domain->RegisterObject(object_id, std::move(m_session->m_srv_obj_holder));
++                        domain->TryRegisterMirroredObject(object_id, std::move(m_session->m_srv_obj_holder));
+ 
+                         /* Set the new object holder. */
+                         m_session->m_srv_obj_holder = cmif::ServiceObjectHolder(std::move(cmif_domain));
