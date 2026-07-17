@@ -18,8 +18,13 @@ namespace ams::mitm::ldn {
             LdnMitMService(std::shared_ptr<::Service> &&s, const sm::MitmProcessInfo &c);
             
             static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
-                LogFormat("should_mitm pid: %" PRIu64 " tid: %" PRIx64, client_info.process_id, client_info.program_id);
-                return true;
+                /* Always mitm non-applications so the overlay can reach the config service. */
+                const bool is_app = ncm::IsApplicationId(client_info.program_id);
+                const bool mitm = !is_app || LdnConfig::getEnabled();
+                LogFormat("should_mitm pid: %" PRIu64 " tid: %" PRIx64 " app %d -> %d",
+                    client_info.process_id, client_info.program_id,
+                    static_cast<int>(is_app), static_cast<int>(mitm));
+                return mitm;
             }
         // protected:
         public:

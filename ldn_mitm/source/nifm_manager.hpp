@@ -7,7 +7,6 @@ namespace ams::mitm::ldn {
     class NifmSessionManager {
         private:
             static os::SdkMutex g_mutex;
-            static bool g_initialized;
             static int g_refcount;
         public:
             static Result Acquire();
@@ -19,6 +18,8 @@ namespace ams::mitm::ldn {
             Result rc;
         public:
             ScopedNifmSession() : rc(NifmSessionManager::Acquire()) {}
+            ScopedNifmSession(const ScopedNifmSession &) = delete;
+            ScopedNifmSession &operator=(const ScopedNifmSession &) = delete;
             ~ScopedNifmSession() {
                 if (R_SUCCEEDED(rc)) {
                     NifmSessionManager::Release();

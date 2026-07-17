@@ -11,6 +11,7 @@
 #include <cstring>
 #include "ldn_types.hpp"
 #include "lan_protocol.hpp"
+#include "relay_client.hpp"
 
 namespace ams::mitm::ldn {
     const size_t StackSize = 0x4000;
@@ -31,14 +32,25 @@ namespace ams::mitm::ldn {
 
     class LANDiscovery;
 
+    /* RelayHeartbeat payload; ipv4 is the sender, host order. */
+    struct RelayHeartbeatPayload {
+        MacAddress bssid;
+        u8 _pad[2];
+        u32 ipv4;
+    };
+
     class LanStation : public Pollable {
         protected:
             friend class LANDiscovery;
+            friend class RelayLanSocket;
             NodeInfo *nodeInfo;
             NodeStatus status;
             std::unique_ptr<TcpLanSocketBase> socket;
             int nodeId;
             LANDiscovery *discovery;
+        public:
+            /* Relay stations only. Guarded by discovery->dataMutex. */
+            os::Tick lastSeen = os::Tick(0);
         public:
             LanStation(int nodeId, LANDiscovery *discovery)
                 : nodeInfo(nullptr),
@@ -116,9 +128,32 @@ namespace ams::mitm::ldn {
             void onClose() override;
     };
 
+    class RelayLanSocket : public UdpLanSocketBase, public Pollable {
+        protected:
+            relay::RelayTransport transport;
+            LANDiscovery *discovery;
+            virtual u32 getBroadcast() override { return 0x0A0DFFFFu; } /* 10.13.255.255 */
+            virtual ssize_t recvfrom(void *buf, size_t len, struct sockaddr_in *addr) override;
+            virtual int sendto(const void *buf, size_t len, struct sockaddr_in *addr) override;
+        public:
+            RelayLanSocket(LANDiscovery *discovery) : UdpLanSocketBase(-1, 11452), discovery(discovery) {}
+            Result open() { return this->transport.Open(); }
+            int getFd() override { return this->transport.GetFd(); }
+            int onRead() override;
+            void onClose() override;
+            void keepalive() { this->transport.SendKeepalive(); }
+            int send(LANPacketType type, const void *data, size_t size) {
+                return this->sendPacket(type, data, size);
+            }
+    };
+
     class LANDiscovery {
         public:
             static const int DefaultPort = 11452;
+            /* Relay re-announce interval; must stay under the server's 60s idle timeout. */
+            static constexpr s64 RelayBeaconIntervalMs = 5000;
+            static constexpr s64 RelayPeerTimeoutMs = 30000;
+            static constexpr s64 RelayAdvertiseMinIntervalMs = 2000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
@@ -128,6 +163,7 @@ namespace ams::mitm::ldn {
             friend class LDUdpSocket;
             friend class LDTcpSocket;
             friend class LanStation;
+            friend class RelayLanSocket;
             // 0: udp 1: tcp 2: client
             os::Mutex pollMutex;
             // Recursive: updateNodes() runs both with and without it held.
@@ -135,6 +171,7 @@ namespace ams::mitm::ldn {
             os::Mutex dataMutex;
             std::unique_ptr<LDUdpSocket> udp;
             std::unique_ptr<LDTcpSocket> tcp;
+            std::unique_ptr<RelayLanSocket> relay;
             std::array<LanStation, StationCountMax> stations;
             std::array<NodeLatestUpdate, NodeCountMax> nodeChanges;
             std::array<u8, NodeCountMax> nodeLastStates;
@@ -144,6 +181,17 @@ namespace ams::mitm::ldn {
             bool stop;
             bool initialized;
             NetworkInfo networkInfo;
+            /* Guarded by dataMutex (through lastRelayAdvertise). */
+            MacAddress joinBssid{};
+            bool joinActive = false;
+            os::Tick hostLastSeen = os::Tick(0);
+            bool relayJoined = false;
+            u32 relayJoinedIp = 0;
+            os::Tick lastRelayAdvertise = os::Tick(0);
+            bool initRelay = false;
+            bool initListening = true;
+            bool needsReinit = false;
+            Result refreshNetworkSession();
             u16 listenPort;
             os::ThreadType workerThread;
             CommState state;
@@ -151,6 +199,7 @@ namespace ams::mitm::ldn {
             int loopPoll();
             void onSyncNetwork(NetworkInfo *info);
             void onConnect(int new_fd);
+            void onRelayConnect(const NodeInfo *info);
             void onDisconnectFromHost();
             void onNetworkInfoChanged();
 

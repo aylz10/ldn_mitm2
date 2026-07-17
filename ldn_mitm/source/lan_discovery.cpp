@@ -96,9 +96,127 @@ namespace ams::mitm::ldn {
     }
 
     void LDUdpSocket::onClose() {
-        discovery->disconnect_reason = DisconnectReason::SignalLost;
-        discovery->setState(CommState::Error);
+        this->close();
+        discovery->needsReinit = true;
+        if (discovery->getState() != CommState::Error) {
+            discovery->disconnect_reason =
+                (discovery->getState() == CommState::AccessPointCreated)
+                    ? DisconnectReason::DestroyedBySystem
+                    : DisconnectReason::DisconnectedBySystem;
+            discovery->setState(CommState::Error);
+        }
     };
+
+    void RelayLanSocket::onClose() {
+        this->transport.Close();
+        this->discovery->needsReinit = true;
+    }
+
+    ssize_t RelayLanSocket::recvfrom(void *buf, size_t len, struct sockaddr_in *addr) {
+        u32 src = 0;
+        const int n = this->transport.RecvBroadcast(buf, len, &src);
+        if (n <= 0) {
+            return n;
+        }
+        if (addr) {
+            addr->sin_family = AF_INET;
+            addr->sin_port = htons(11452);
+            addr->sin_addr.s_addr = htonl(src);
+        }
+        return n;
+    }
+
+    int RelayLanSocket::sendto(const void *buf, size_t len, struct sockaddr_in *addr) {
+        AMS_UNUSED(addr);
+        return this->transport.SendBroadcast(buf, len);
+    }
+
+    int RelayLanSocket::onRead() {
+        this->recvPacket([&](LANPacketType type, const void *data, size_t size, ReplyFunc reply) -> int {
+            AMS_UNUSED(reply);
+            switch (type) {
+                case LANPacketType::Scan: {
+                    if (this->discovery->getState() == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->discovery->dataMutex);
+                        /* Throttled: the beacon already advertises us. */
+                        const os::Tick now = os::GetSystemTick();
+                        if (os::ConvertToTimeSpan(now - this->discovery->lastRelayAdvertise).GetMilliSeconds() >= LANDiscovery::RelayAdvertiseMinIntervalMs) {
+                            this->discovery->lastRelayAdvertise = now;
+                            this->sendPacket(LANPacketType::ScanResp, &this->discovery->networkInfo, sizeof(NetworkInfo));
+                            LogFormat("relay: Scan -> replied ScanResp");
+                        }
+                    }
+                    break;
+                }
+                case LANPacketType::ScanResp: {
+                    NetworkInfo *info = (decltype(info))data;
+                    if (size != sizeof(*info)) {
+                        break;
+                    }
+                    std::scoped_lock lock(this->discovery->dataMutex);
+                    if (this->discovery->joinActive &&
+                        info->common.bssid == this->discovery->joinBssid) {
+                        this->discovery->hostLastSeen = os::GetSystemTick();
+                    }
+                    if (this->discovery->udp) {
+                        if (this->discovery->udp->selfIp != 0 &&
+                            info->ldn.nodes[0].ipv4Address == this->discovery->udp->selfIp) {
+                            break;
+                        }
+                        this->discovery->udp->scanResults.insert({info->common.bssid, *info});
+                        LogFormat("relay: got ScanResp, %zu result(s)", this->discovery->udp->scanResults.size());
+                    }
+                    break;
+                }
+                case LANPacketType::Connect: {
+                    NodeInfo *info = (decltype(info))data;
+                    if (size != sizeof(*info)) {
+                        break;
+                    }
+                    if (this->discovery->getState() == CommState::AccessPointCreated) {
+                        LogFormat("relay: got Connect from %08x", info->ipv4Address);
+                        this->discovery->onRelayConnect(info);
+                    }
+                    break;
+                }
+                case LANPacketType::SyncNetwork: {
+                    NetworkInfo *info = (decltype(info))data;
+                    if (size != sizeof(*info)) {
+                        break;
+                    }
+                    if (this->discovery->getState() == CommState::Station ||
+                        this->discovery->getState() == CommState::StationConnected) {
+                        LogFormat("relay: got SyncNetwork");
+                        this->discovery->onSyncNetwork(info);
+                    }
+                    break;
+                }
+                case LANPacketType::RelayHeartbeat: {
+                    const RelayHeartbeatPayload *hb = (decltype(hb))data;
+                    if (size != sizeof(*hb)) {
+                        break;
+                    }
+                    if (this->discovery->getState() == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->discovery->dataMutex);
+                        if (hb->bssid == this->discovery->networkInfo.common.bssid) {
+                            for (auto &st : this->discovery->stations) {
+                                if (st.getStatus() == NodeStatus::Connected &&
+                                    st.getFd() < 0 &&
+                                    st.nodeInfo->ipv4Address == hb->ipv4) {
+                                    st.lastSeen = os::GetSystemTick();
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+            return 0;
+        });
+        return 0;
+    }
 
     int LDTcpSocket::onRead() {
         LogFormat("LDTcpSocket::onRead");
@@ -159,6 +277,11 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::onSyncNetwork(NetworkInfo *info) {
         std::scoped_lock lock(this->dataMutex);
+        if (!this->joinActive || !(info->common.bssid == this->joinBssid)) {
+            LogFormat("onSyncNetwork: not for our target network, ignoring");
+            return;
+        }
+        this->hostLastSeen = os::GetSystemTick();
         this->networkInfo = *info;
         if (this->state == CommState::Station) {
             this->setState(CommState::StationConnected);
@@ -194,9 +317,43 @@ namespace ams::mitm::ldn {
         }
     }
 
+    void LANDiscovery::onRelayConnect(const NodeInfo *info) {
+        std::scoped_lock lock(this->dataMutex);
+
+        for (auto &st : this->stations) {
+            if (st.getStatus() != NodeStatus::Disconnected &&
+                st.nodeInfo->ipv4Address == info->ipv4Address) {
+                LogFormat("relay: duplicate Connect from %08x, re-syncing", info->ipv4Address);
+                st.lastSeen = os::GetSystemTick();
+                this->updateNodes();
+                return;
+            }
+        }
+
+        if (this->stationCount() >= StationCountMax) {
+            LogFormat("relay: stations full, ignoring Connect");
+            return;
+        }
+        for (auto &st : this->stations) {
+            if (st.getStatus() == NodeStatus::Disconnected) {
+                *st.nodeInfo = *info;             /* into networkInfo.ldn.nodes[nodeId] */
+                st.status = NodeStatus::Connected;
+                st.lastSeen = os::GetSystemTick();
+                LogFormat("relay: station %d connected (%08x)", st.nodeId, info->ipv4Address);
+                this->updateNodes();
+                return;
+            }
+        }
+        LogFormat("relay: no free station slot");
+    }
+
     void LANDiscovery::onDisconnectFromHost() {
         LogFormat("onDisconnectFromHost state: %d", static_cast<int>(this->state));
         if (this->state == CommState::StationConnected) {
+            {
+                std::scoped_lock lock(this->dataMutex);
+                this->relayJoined = false;
+            }
             this->disconnect_reason = DisconnectReason::SignalLost;
             this->setState(CommState::Station);
         }
@@ -421,6 +578,9 @@ namespace ams::mitm::ldn {
                 if (len < 0 && j == 0) {
                     return MAKERESULT(ModuleID, 20);
                 }
+                if (this->relay) {
+                    this->relay->sendBroadcast(LANPacketType::Scan);
+                }
             }
             svcSleepThread(100000000L); // 100ms
 
@@ -476,7 +636,11 @@ namespace ams::mitm::ldn {
                 static_cast<int>(copy));
 
             if (copy) {
-                pOutNetwork[i++] = info;
+                if (info.ldn.nodes[0].userName[0] != 0) {
+                    pOutNetwork[i++] = info;
+                } else {
+                    LogFormat("scan: skipping result with empty username (not synced yet)");
+                }
             }
         }
         *count = i;
@@ -514,8 +678,12 @@ namespace ams::mitm::ldn {
         }
         this->networkInfo.ldn.nodeCount = count + 1;
 
+        if (this->relay) {
+            this->relay->send(LANPacketType::SyncNetwork, &this->networkInfo, sizeof(this->networkInfo));
+        }
+        /* Relay-only stations have no socket. */
         for (auto &i : stations) {
-            if (i.getStatus() == NodeStatus::Connected) {
+            if (i.getStatus() == NodeStatus::Connected && i.getFd() >= 0) {
                 int ret = i.sendPacket(LANPacketType::SyncNetwork, &this->networkInfo, sizeof(this->networkInfo));
                 if (ret < 0) {
                     LogFormat("Failed to sendTcp");
@@ -559,12 +727,13 @@ namespace ams::mitm::ldn {
         }
 
         std::scoped_lock lock(this->pollMutex);
-        int nfds = 2 + StationCountMax;
+        int nfds = 3 + StationCountMax;
         Pollable *fds[nfds];
         fds[0] = this->udp.get();
         fds[1] = this->tcp.get();
+        fds[2] = this->relay.get();
         for (int i = 0; i < StationCountMax; i++) {
-            fds[2 + i] = this->stations.data() + i;
+            fds[3 + i] = this->stations.data() + i;
         }
         rc = Pollable::Poll(fds, nfds);
 
@@ -582,11 +751,63 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::worker() {
         this->stop = false;
+        os::Tick last_beacon = os::GetSystemTick();
         while (!this->stop) {
 
             int rc = loopPoll();
             if (rc < 0) {
                 break;
+            }
+            if (this->relay) {
+                const os::Tick now = os::GetSystemTick();
+                if (os::ConvertToTimeSpan(now - last_beacon).GetMilliSeconds() >= RelayBeaconIntervalMs) {
+                    last_beacon = now;
+                    if (this->state == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->dataMutex);
+                        this->lastRelayAdvertise = now;
+                        this->relay->send(LANPacketType::ScanResp, &this->networkInfo, sizeof(this->networkInfo));
+                    } else if (this->state == CommState::StationConnected && this->relayJoined) {
+                        RelayHeartbeatPayload hb = {};
+                        {
+                            std::scoped_lock lock(this->dataMutex);
+                            hb.bssid = this->joinBssid;
+                            hb.ipv4  = this->relayJoinedIp;
+                        }
+                        this->relay->send(LANPacketType::RelayHeartbeat, &hb, sizeof(hb));
+                    } else {
+                        this->relay->keepalive();
+                    }
+
+                    if (this->state == CommState::AccessPointCreated) {
+                        std::scoped_lock lock(this->dataMutex);
+                        bool changed = false;
+                        for (auto &st : this->stations) {
+                            if (st.getStatus() == NodeStatus::Connected && st.getFd() < 0 &&
+                                os::ConvertToTimeSpan(now - st.lastSeen).GetMilliSeconds() >= RelayPeerTimeoutMs) {
+                                LogFormat("relay: station %d (%08x) silent > %ds, dropping",
+                                    st.nodeId, st.nodeInfo->ipv4Address,
+                                    static_cast<int>(RelayPeerTimeoutMs / 1000));
+                                st.reset();
+                                changed = true;
+                            }
+                        }
+                        if (changed) {
+                            this->updateNodes();
+                        }
+                    } else if (this->state == CommState::StationConnected) {
+                        bool host_lost = false;
+                        {
+                            std::scoped_lock lock(this->dataMutex);
+                            host_lost = this->relayJoined &&
+                                os::ConvertToTimeSpan(now - this->hostLastSeen).GetMilliSeconds() >= RelayPeerTimeoutMs;
+                        }
+                        if (host_lost) {
+                            LogFormat("relay: host silent > %ds, disconnecting",
+                                static_cast<int>(RelayPeerTimeoutMs / 1000));
+                            this->onDisconnectFromHost();
+                        }
+                    }
+                }
             }
             /* Brief unlocked window so IPC threads can grab pollMutex. */
             svcSleepThread(1000000L); // 1ms
@@ -741,9 +962,27 @@ namespace ams::mitm::ldn {
                 this->tcp->close();
             }
         }
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->joinActive = false;
+            this->relayJoined = false;
+        }
         this->setState(CommState::Station);
 
         return 0;
+    }
+
+    Result LANDiscovery::refreshNetworkSession() {
+        const bool relay_changed = this->initRelay != relay::IsEnabled();
+        if (!this->initialized || (!relay_changed && !this->needsReinit)) {
+            return 0;
+        }
+        LogFormat("refreshing network session (relay %d -> %d, post-sleep %d)",
+            static_cast<int>(this->initRelay), static_cast<int>(relay::IsEnabled()),
+            static_cast<int>(this->needsReinit));
+        LanEventFunc ev = this->lanEvent;
+        this->finalize();  /* tears down state even on failure */
+        R_RETURN(this->initialize(ev, this->initListening));
     }
 
     Result LANDiscovery::openAccessPoint() {
@@ -751,6 +990,7 @@ namespace ams::mitm::ldn {
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
+        R_TRY(this->refreshNetworkSession());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -789,6 +1029,7 @@ namespace ams::mitm::ldn {
         if (this->state == CommState::None) {
             return MAKERESULT(LdnModuleId, 32);
         }
+        R_TRY(this->refreshNetworkSession());
 
         {
             std::scoped_lock lock(this->pollMutex);
@@ -796,6 +1037,11 @@ namespace ams::mitm::ldn {
                 this->tcp->close();
             }
             this->resetStations();
+        }
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->joinActive = false;
+            this->relayJoined = false;
         }
 
         this->setState(CommState::Station);
@@ -836,6 +1082,42 @@ namespace ams::mitm::ldn {
                 LogFormat("connect: host IP %x equals our own; refusing self-connect", hostIp);
                 return ResultConnectFailed;
             }
+        }
+
+        /* Set before Connect goes out: the reply may arrive immediately. */
+        {
+            std::scoped_lock lock(this->dataMutex);
+            this->joinBssid = networkInfo->common.bssid;
+            this->joinActive = true;
+        }
+
+        if (this->relay) {
+            NodeInfo myNode = {0};
+            Result rc = this->getNodeInfo(&myNode, userConfig, localCommunicationVersion);
+            if (R_FAILED(rc)) {
+                return rc;
+            }
+            {
+                std::scoped_lock lock(this->dataMutex);
+                this->initNodeStateChange();
+            }
+            LogFormat("relay connect: sending Connect to host %08x", hostIp);
+            this->relay->send(LANPacketType::Connect, &myNode, sizeof(myNode));
+
+            for (int j = 0; j < 300; j++) {
+                if (this->state == CommState::StationConnected) {
+                    LogFormat("relay connect: joined");
+                    {
+                        std::scoped_lock lock(this->dataMutex);
+                        this->relayJoined   = true;
+                        this->relayJoinedIp = myNode.ipv4Address;
+                        this->hostLastSeen  = os::GetSystemTick();
+                    }
+                    return 0;
+                }
+                svcSleepThread(10000000L); /* 10ms */
+            }
+            LogFormat("relay connect: no SyncNetwork, falling back to direct TCP to %08x", hostIp);
         }
 
         struct sockaddr_in addr;
@@ -962,6 +1244,7 @@ namespace ams::mitm::ldn {
             os::DestroyThread(&this->workerThread);
             this->udp.reset();
             this->tcp.reset();
+            this->relay.reset();
             this->resetStations();
             this->initialized = false;
 
@@ -1051,13 +1334,22 @@ namespace ams::mitm::ldn {
             return rc;
         }
 
-        rc = nifmSetLocalNetworkMode(&request, true);
-        if (R_FAILED(rc)) {
-            LogFormat("nifmSetLocalNetworkMode failed %x", rc);
-            nifmRequestCancel(&request);
-            nifmRequestClose(&request);
-            restoreMtu();
-            return rc;
+        /* Latch once: the overlay can toggle relay mode at any time. */
+        const bool use_relay = relay::IsEnabled();
+        this->initRelay = use_relay;
+        this->initListening = listening;
+        this->needsReinit = false;
+
+        /* Relay mode needs internet access, so no local network mode. */
+        if (!use_relay) {
+            rc = nifmSetLocalNetworkMode(&request, true);
+            if (R_FAILED(rc)) {
+                LogFormat("nifmSetLocalNetworkMode failed %x", rc);
+                nifmRequestCancel(&request);
+                nifmRequestClose(&request);
+                restoreMtu();
+                return rc;
+            }
         }
 
         rc = nifmRequestSubmitAndWait(&request);
@@ -1084,6 +1376,17 @@ namespace ams::mitm::ldn {
             nifmRequestClose(&request);
             restoreMtu();
             return rc;
+        }
+
+        if (use_relay) {
+            this->relay = std::make_unique<RelayLanSocket>(this);
+            Result relay_rc = this->relay->open();
+            if (R_FAILED(relay_rc)) {
+                LogFormat("LANDiscovery: relay open failed %x (local-only)", relay_rc);
+                this->relay.reset();
+            } else {
+                LogFormat("LANDiscovery: relay open ok");
+            }
         }
 
         rc = os::CreateThread(&this->workerThread, &Worker, this, reinterpret_cast<void *>(util::AlignUp(reinterpret_cast<uintptr_t>(stack.get()), os::ThreadStackAlignment)), StackSize, 0x15, 2);

@@ -4,7 +4,6 @@
 namespace ams::mitm::ldn {
 
     os::SdkMutex NifmSessionManager::g_mutex;
-    bool NifmSessionManager::g_initialized = false;
     int NifmSessionManager::g_refcount = 0;
 
     Result NifmSessionManager::Acquire() {
@@ -16,12 +15,11 @@ namespace ams::mitm::ldn {
                 LogFormat("NifmSessionManager: nifmInitialize failed: %x", rc);
                 return rc;
             }
-            g_initialized = true;
             LogFormat("NifmSessionManager: session acquired");
         }
 
         g_refcount++;
-        return 0;
+        R_SUCCEED();
     }
 
     void NifmSessionManager::Release() {
@@ -34,9 +32,8 @@ namespace ams::mitm::ldn {
 
         g_refcount--;
 
-        if (g_refcount == 0 && g_initialized) {
+        if (g_refcount == 0) {
             nifmExit();
-            g_initialized = false;
             LogFormat("NifmSessionManager: session released");
         }
     }

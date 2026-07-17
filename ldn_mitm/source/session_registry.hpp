@@ -38,4 +38,25 @@ namespace ams::mitm::ldn {
             static void Get(Snapshot *out);
     };
 
+    class GameRx {
+        public:
+            static constexpr int  MaxEntries = 32;
+            static constexpr int  MaxPayload = 1472;   /* 1500 MTU - IP/UDP headers */
+
+            static void SetGameFd(s32 fd);
+            static s32  GameFd();
+
+            /* Host byte order. Drops the oldest entry if full. */
+            static void Push(u32 src_ip, u16 sport, u16 dport, const void *data, size_t len);
+
+            static bool Pop(u32 *src_ip, u16 *sport, void *out, size_t max_len, size_t *out_len);
+
+            /* dport of the oldest queued frame, 0 if empty. */
+            static u16 PeekDport();
+
+            static bool HasData();
+
+            static void Clear();
+    };
+
 }

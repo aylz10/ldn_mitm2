@@ -1,0 +1,13 @@
+# ldn_mitm relay servers; copy to sdmc:/config/ldn_mitm/relay.cfg
+# One per line: <name> <IPv4 or hostname>[:port]  (default port 11451, max 8)
+# Enable the relay from the Tesla overlay; it saves its settings here:
+# internet relay on at boot
+#enabled=1
+# broadcast relay
+#broadcast=1
+# active server, by name
+#selected=my-pc
+
+my-pc        82.65.234.243:11455
+lan-play     104.238.152.86
+public       relay.example.com

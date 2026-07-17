@@ -33,6 +33,7 @@ extern "C" {
 
 #include "ldnmitm_service.hpp"
 #include "bsd_mitm_service.hpp"
+#include "relay_client.hpp"
 
 namespace ams {
 
@@ -258,6 +259,8 @@ namespace ams {
         constexpr sm::ServiceName BsdMitmServiceName = sm::ServiceName::Encode("bsd:u");
         R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::BsdMitmService>(mitm::PortIndex_Bsd, BsdMitmServiceName)));
         LogFormat("registered");
+
+        mitm::ldn::relay::LoadConfig();
 
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,

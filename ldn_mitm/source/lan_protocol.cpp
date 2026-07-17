@@ -38,9 +38,15 @@ int Pollable::Poll(Pollable *fds[], size_t nfds, int timeout) {
             if (pfd.revents & POLL_UNKNOWN) {
                 LogFormat("Poll: %zu(%d) revents=0x%08X", i, pfd.fd, pfd.revents);
             }
-            if (pfd.revents & (POLLERR | POLLHUP)) {
-                LogFormat("Poll: (POLLERR | POLLHUP) %zu(%d) revents=0x%x", i, pfd.fd, pfd.revents);
+            if (pfd.revents & (POLLHUP | POLLNVAL)) {
+                LogFormat("Poll: (POLLHUP/POLLNVAL) %zu(%d) revents=0x%x", i, pfd.fd, pfd.revents);
                 fds[i]->onClose();
+            } else if (pfd.revents & POLLERR) {
+                /* Usually transient (ICMP): clear SO_ERROR and keep the socket. */
+                int soerr = 0;
+                socklen_t optlen = sizeof(soerr);
+                getsockopt(pfd.fd, SOL_SOCKET, SO_ERROR, &soerr, &optlen);
+                LogFormat("Poll: transient POLLERR %zu(%d) so_error=%d, keeping socket", i, pfd.fd, soerr);
             } else if (pfd.revents & (POLLIN | POLLPRI)) {
                 int rc = fds[i]->onRead();
                 if (rc != 0) {

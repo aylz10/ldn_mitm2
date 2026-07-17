@@ -7,6 +7,7 @@ enum class LANPacketType : u8 {
     ScanResp,
     Connect,
     SyncNetwork,
+    RelayHeartbeat,
 };
 
 typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;

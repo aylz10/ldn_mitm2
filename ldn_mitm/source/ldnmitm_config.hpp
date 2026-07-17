@@ -15,6 +15,9 @@ namespace ams::mitm::ldn {
             static bool getBroadcastRelay() {
                 return BroadcastRelay;
             }
+            static void setBroadcastRelay(bool v) {
+                BroadcastRelay = v;
+            }
         protected:
             static std::atomic_bool LdnEnabled;
             static std::atomic_bool BroadcastRelay;
@@ -27,6 +30,12 @@ namespace ams::mitm::ldn {
             Result SetEnabled(u32 enabled);
             Result GetBroadcastRelay(sf::Out<u32> enabled);
             Result SetBroadcastRelay(u32 enabled);
+            Result GetInternetRelay(sf::Out<u32> enabled);
+            Result SetInternetRelay(u32 enabled);
+            Result GetRelayServerCount(sf::Out<u32> count);
+            Result GetRelayServerName(u32 index, sf::Out<RelayServerName> name);
+            Result GetSelectedRelayServer(sf::Out<u32> index);
+            Result SetSelectedRelayServer(u32 index);
     };
     static_assert(ams::mitm::ldn::IsILdnConfig<LdnConfig>);
 

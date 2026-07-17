@@ -15,6 +15,8 @@
  */
 
 #include "session_registry.hpp"
+#include <mutex>
+#include <cstring>
 
 namespace ams::mitm::ldn {
 
@@ -37,13 +39,100 @@ namespace ams::mitm::ldn {
     }
 
     void SessionRegistry::Clear() {
-        std::scoped_lock lk(g_mutex);
-        g_state = {};
+        {
+            std::scoped_lock lk(g_mutex);
+            g_state = {};
+        }
+        /* The relay receive queue shares the session lifetime. */
+        GameRx::Clear();
     }
 
     void SessionRegistry::Get(Snapshot *out) {
         std::scoped_lock lk(g_mutex);
         *out = g_state;
+    }
+
+    namespace {
+        struct GameRxEntry {
+            u32 src_ip;
+            u16 sport;
+            u16 dport;
+            u16 len;
+            u8  data[GameRx::MaxPayload];
+        };
+        os::SdkMutex g_rx_mutex;
+        GameRxEntry g_rx_ring[GameRx::MaxEntries];
+        int g_rx_head = 0;
+        int g_rx_count = 0;
+        s32 g_game_fd = -1;
+    }
+
+    void GameRx::SetGameFd(s32 fd) {
+        std::scoped_lock lk(g_rx_mutex);
+        g_game_fd = fd;
+    }
+
+    s32 GameRx::GameFd() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_game_fd;
+    }
+
+    void GameRx::Push(u32 src_ip, u16 sport, u16 dport, const void *data, size_t len) {
+        if (len == 0 || len > MaxPayload) {
+            return;
+        }
+        std::scoped_lock lk(g_rx_mutex);
+        /* Enqueue even before the game fd is known. */
+        int slot;
+        if (g_rx_count == MaxEntries) {
+            slot = g_rx_head;
+            g_rx_head = (g_rx_head + 1) % MaxEntries;
+        } else {
+            slot = (g_rx_head + g_rx_count) % MaxEntries;
+            g_rx_count++;
+        }
+        GameRxEntry &e = g_rx_ring[slot];
+        e.src_ip = src_ip;
+        e.sport = sport;
+        e.dport = dport;
+        e.len = static_cast<u16>(len);
+        std::memcpy(e.data, data, len);
+    }
+
+    bool GameRx::Pop(u32 *src_ip, u16 *sport, void *out, size_t max_len, size_t *out_len) {
+        std::scoped_lock lk(g_rx_mutex);
+        if (g_rx_count == 0) {
+            return false;
+        }
+        const GameRxEntry &e = g_rx_ring[g_rx_head];
+        const size_t n = e.len < max_len ? e.len : max_len;
+        std::memcpy(out, e.data, n);
+        if (src_ip)  { *src_ip = e.src_ip; }
+        if (sport)   { *sport = e.sport; }
+        if (out_len) { *out_len = n; }
+        g_rx_head = (g_rx_head + 1) % MaxEntries;
+        g_rx_count--;
+        return true;
+    }
+
+    bool GameRx::HasData() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_rx_count > 0;
+    }
+
+    u16 GameRx::PeekDport() {
+        std::scoped_lock lk(g_rx_mutex);
+        if (g_rx_count == 0) {
+            return 0;
+        }
+        return g_rx_ring[g_rx_head].dport;
+    }
+
+    void GameRx::Clear() {
+        std::scoped_lock lk(g_rx_mutex);
+        g_rx_count = 0;
+        g_rx_head = 0;
+        g_game_fd = -1;
     }
 
 }
