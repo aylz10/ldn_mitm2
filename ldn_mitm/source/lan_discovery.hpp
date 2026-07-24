@@ -142,6 +142,12 @@ namespace ams::mitm::ldn {
             int onRead() override;
             void onClose() override;
             void keepalive() { this->transport.SendKeepalive(); }
+            void ping() { this->transport.SendPing(); }
+            bool pathDead() const { return this->transport.PathDead(); }
+            Result reopen() {
+                this->transport.Close();
+                return this->transport.Open();
+            }
             int send(LANPacketType type, const void *data, size_t size) {
                 return this->sendPacket(type, data, size);
             }
@@ -154,6 +160,7 @@ namespace ams::mitm::ldn {
             static constexpr s64 RelayBeaconIntervalMs = 5000;
             static constexpr s64 RelayPeerTimeoutMs = 30000;
             static constexpr s64 RelayAdvertiseMinIntervalMs = 2000;
+            static constexpr s64 RelayReconnectMinIntervalMs = 15000;
             static const char *FakeSsid;
             typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
             typedef std::function<void()> LanEventFunc;
@@ -184,10 +191,15 @@ namespace ams::mitm::ldn {
             /* Guarded by dataMutex (through lastRelayAdvertise). */
             MacAddress joinBssid{};
             bool joinActive = false;
+            u16 relaySyncSeq = 0;
+            bool relaySyncSeqValid = false;
             os::Tick hostLastSeen = os::Tick(0);
             bool relayJoined = false;
             u32 relayJoinedIp = 0;
+            u32 joinAwaitSelfIp = 0;
             os::Tick lastRelayAdvertise = os::Tick(0);
+            /* Worker thread only. */
+            os::Tick lastRelayReconnect = os::Tick(0);
             bool initRelay = false;
             bool initListening = true;
             bool needsReinit = false;
@@ -197,7 +209,8 @@ namespace ams::mitm::ldn {
             CommState state;
             void worker();
             int loopPoll();
-            void onSyncNetwork(NetworkInfo *info);
+            /* relaySeq 0 skips the staleness check (non-relay sync). */
+            void onSyncNetwork(NetworkInfo *info, u16 relaySeq = 0);
             void onConnect(int new_fd);
             void onRelayConnect(const NodeInfo *info);
             void onDisconnectFromHost();

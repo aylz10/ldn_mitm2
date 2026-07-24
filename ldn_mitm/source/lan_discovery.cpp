@@ -187,7 +187,7 @@ namespace ams::mitm::ldn {
                     if (this->discovery->getState() == CommState::Station ||
                         this->discovery->getState() == CommState::StationConnected) {
                         LogFormat("relay: got SyncNetwork");
-                        this->discovery->onSyncNetwork(info);
+                        this->discovery->onSyncNetwork(info, this->lastRecvSeq());
                     }
                     break;
                 }
@@ -275,16 +275,38 @@ namespace ams::mitm::ldn {
         return ret;
     }
 
-    void LANDiscovery::onSyncNetwork(NetworkInfo *info) {
+    void LANDiscovery::onSyncNetwork(NetworkInfo *info, u16 relaySeq) {
         std::scoped_lock lock(this->dataMutex);
         if (!this->joinActive || !(info->common.bssid == this->joinBssid)) {
             LogFormat("onSyncNetwork: not for our target network, ignoring");
             return;
         }
+        if (relaySeq != 0) {
+            /* Up to 256 behind is stale; a larger jump back is a sender restart. */
+            if (this->relaySyncSeqValid && (u16)(this->relaySyncSeq - relaySeq) < 256) {
+                LogFormat("onSyncNetwork: stale relay seq %u (have %u), dropping",
+                    relaySeq, this->relaySyncSeq);
+                return;
+            }
+            this->relaySyncSeq = relaySeq;
+            this->relaySyncSeqValid = true;
+        }
         this->hostLastSeen = os::GetSystemTick();
         this->networkInfo = *info;
         if (this->state == CommState::Station) {
-            this->setState(CommState::StationConnected);
+            /* Relay join: connected only once the host lists our IP. */
+            bool present = (this->joinAwaitSelfIp == 0);
+            for (int i = 0; !present && i < NodeCountMax; i++) {
+                if (info->ldn.nodes[i].isConnected &&
+                    info->ldn.nodes[i].ipv4Address == this->joinAwaitSelfIp) {
+                    present = true;
+                }
+            }
+            if (present) {
+                this->setState(CommState::StationConnected);
+            } else {
+                LogFormat("onSyncNetwork: host has not registered us yet, still connecting");
+            }
         }
         this->onNetworkInfoChanged();
 
@@ -778,6 +800,17 @@ namespace ams::mitm::ldn {
                         this->relay->keepalive();
                     }
 
+                    if (this->relay->pathDead()) {
+                        if (os::ConvertToTimeSpan(now - this->lastRelayReconnect).GetMilliSeconds() >= RelayReconnectMinIntervalMs) {
+                            this->lastRelayReconnect = now;
+                            LogFormat("relay: server path dead, reconnecting transport");
+                            const Result rc = this->relay->reopen();
+                            LogFormat("relay: reconnect %s (%x)", R_SUCCEEDED(rc) ? "ok" : "failed", rc);
+                        }
+                    } else {
+                        this->relay->ping();
+                    }
+
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
                         bool changed = false;
@@ -966,6 +999,7 @@ namespace ams::mitm::ldn {
             std::scoped_lock lock(this->dataMutex);
             this->joinActive = false;
             this->relayJoined = false;
+            this->joinAwaitSelfIp = 0;
         }
         this->setState(CommState::Station);
 
@@ -1042,6 +1076,7 @@ namespace ams::mitm::ldn {
             std::scoped_lock lock(this->dataMutex);
             this->joinActive = false;
             this->relayJoined = false;
+            this->joinAwaitSelfIp = 0;
         }
 
         this->setState(CommState::Station);
@@ -1089,6 +1124,7 @@ namespace ams::mitm::ldn {
             std::scoped_lock lock(this->dataMutex);
             this->joinBssid = networkInfo->common.bssid;
             this->joinActive = true;
+            this->relaySyncSeqValid = false;
         }
 
         if (this->relay) {
@@ -1100,6 +1136,7 @@ namespace ams::mitm::ldn {
             {
                 std::scoped_lock lock(this->dataMutex);
                 this->initNodeStateChange();
+                this->joinAwaitSelfIp = myNode.ipv4Address;
             }
             LogFormat("relay connect: sending Connect to host %08x", hostIp);
             this->relay->send(LANPacketType::Connect, &myNode, sizeof(myNode));
@@ -1115,7 +1152,16 @@ namespace ams::mitm::ldn {
                     }
                     return 0;
                 }
+                /* Every 500ms; the host treats a duplicate Connect as a re-sync. */
+                if (j % 50 == 49) {
+                    LogFormat("relay connect: retransmitting Connect");
+                    this->relay->send(LANPacketType::Connect, &myNode, sizeof(myNode));
+                }
                 svcSleepThread(10000000L); /* 10ms */
+            }
+            {
+                std::scoped_lock lock(this->dataMutex);
+                this->joinAwaitSelfIp = 0;
             }
             LogFormat("relay connect: no SyncNetwork, falling back to direct TCP to %08x", hostIp);
         }

@@ -38,6 +38,8 @@ namespace ams::mitm::ldn::relay {
         /* lan-play relay message types (switch-lan-play/src/lan-client.c). */
         constexpr u8 TypeKeepalive = 0x00;
         constexpr u8 TypeIpv4      = 0x01;
+        constexpr u8 TypePing      = 0x02;
+        constexpr u8 TypeIpv4Frag  = 0x03;
 
         /* 1500 MTU minus relay type, IP and UDP headers. */
         constexpr size_t MaxWrapPayload = 1500 - 1 - 20 - 8;
@@ -464,6 +466,11 @@ namespace ams::mitm::ldn::relay {
         }
 
         m_fd = fd;
+        m_ping_misses = 0;
+        m_ping_supported = false;
+        for (auto &f : m_frags) {
+            f.used = false;
+        }
 
         {
             std::scoped_lock lk(g_bridge_mutex);
@@ -507,6 +514,19 @@ namespace ams::mitm::ldn::relay {
         }
         const u8 ka = TypeKeepalive;
         return send(m_fd, &ka, sizeof(ka), 0);
+    }
+
+    int RelayTransport::SendPing() {
+        if (m_fd < 0) {
+            return -1;
+        }
+        ++m_ping_misses;
+        const u8 p[4] = { TypePing, 'l', 'd', 'n' };
+        return send(m_fd, p, sizeof(p), 0);
+    }
+
+    bool RelayTransport::PathDead() const {
+        return m_fd < 0 || (m_ping_supported && m_ping_misses >= PingMaxMisses);
     }
 
     int RelayTransport::SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len) {
@@ -593,11 +613,85 @@ namespace ams::mitm::ldn::relay {
         if (n <= 0) {
             return (n == 0) ? 0 : -1;
         }
-        if ((buf[0] & 0x7f) != TypeIpv4) {
+        m_ping_misses = 0;
+        const u8 type = buf[0] & 0x7f;
+        if (type == TypePing) {
+            m_ping_supported = true;
             return 0;
         }
-        const u8 *ip = buf + 1;
-        const size_t iplen = static_cast<size_t>(n) - 1;
+        if (type == TypeIpv4Frag) {
+            size_t iplen = 0;
+            const u8 *ip = this->ReassembleFrag(buf + 1, static_cast<size_t>(n) - 1, &iplen);
+            if (ip == nullptr) {
+                return 0;
+            }
+            return this->ProcessIpv4(ip, iplen, out, max_size, out_src_ip);
+        }
+        if (type != TypeIpv4) {
+            return 0;
+        }
+        return this->ProcessIpv4(buf + 1, static_cast<size_t>(n) - 1, out, max_size, out_src_ip);
+    }
+
+    const u8 *RelayTransport::ReassembleFrag(const u8 *p, size_t n, size_t *out_len) {
+        /* lan-play IPV4_FRAG header (16B, BE): src dst id part total_part len
+           pmtu; the chunk sits at pmtu*part. */
+        constexpr size_t HeaderLen = 16;
+        if (n < HeaderLen) {
+            return nullptr;
+        }
+        const u32 src   = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+        const u16 id    = (p[8] << 8) | p[9];
+        const u8  part  = p[10];
+        const u8  total = p[11];
+        const u16 len   = (p[12] << 8) | p[13];
+        const u16 pmtu  = (p[14] << 8) | p[15];
+        const size_t off = static_cast<size_t>(pmtu) * part;
+        /* Untrusted header: bound every field before use as an offset; the
+           completion mask is 8 bits. */
+        if (total == 0 || total > 8 || part >= total ||
+            len > n - HeaderLen || off + len > sizeof(m_frags[0].buffer)) {
+            return nullptr;
+        }
+
+        FragSlot *slot = nullptr;
+        for (auto &f : m_frags) {
+            if (f.used && f.id == id && f.src == src) {
+                slot = &f;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            for (auto &f : m_frags) {
+                if (!f.used) {
+                    slot = &f;
+                    break;
+                }
+            }
+            if (slot == nullptr) {
+                slot = &m_frags[m_frag_evict++ % FragSlots];
+            }
+            slot->used = true;
+            slot->id = id;
+            slot->src = src;
+            slot->mask = 0;
+            slot->total_len = 0;
+        }
+
+        slot->mask |= 1u << part;
+        std::memcpy(slot->buffer + off, p + HeaderLen, len);
+        if (part == total - 1) {
+            slot->total_len = static_cast<u16>(off + len);
+        }
+        if (slot->mask == static_cast<u8>(~(0xFFu << total))) {
+            slot->used = false;
+            *out_len = slot->total_len;
+            return slot->buffer;
+        }
+        return nullptr;
+    }
+
+    int RelayTransport::ProcessIpv4(const u8 *ip, size_t iplen, void *out, size_t max_size, u32 *out_src_ip) {
         if (iplen < 20) {
             return 0;
         }

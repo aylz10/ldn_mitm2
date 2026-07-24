@@ -129,6 +129,7 @@ int LanSocket::recvPacket(MessageCallback callback) {
     }
 
     LANPacketHeader *header = (decltype(header))buffer;
+    this->rxSeq = header->seq;
 
     auto body = buffer + HeaderSize;
     auto bodyLen = len - HeaderSize;
@@ -187,8 +188,11 @@ void LanSocket::prepareHeader(LANPacketHeader &header, LANPacketType type) {
     header.compressed = false;
     header.length = 0;
     header.decompress_length = 0;
-    header._reserved[0] = 0;
-    header._reserved[1] = 0;
+    /* 0 means unstamped; skip it on wrap. */
+    if (++this->txSeq == 0) {
+        ++this->txSeq;
+    }
+    header.seq = this->txSeq;
 }
 
 ssize_t TcpLanSocketBase::recvfrom(void *buf, size_t len, struct sockaddr_in *addr) {

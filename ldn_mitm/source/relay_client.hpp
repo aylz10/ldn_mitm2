@@ -60,6 +60,11 @@ namespace ams::mitm::ldn {
                 int SendBroadcast(const void *lan_packet, size_t size);
                 int SendKeepalive();
 
+                int SendPing();
+
+                /* Ping misses count only once the server has echoed a ping. */
+                bool PathDead() const;
+
                 /* Returns a discovery frame's length; game frames are
                    dispatched internally (returns 0). <0 on error. */
                 int RecvBroadcast(void *out, size_t max_size, u32 *out_src_ip);
@@ -69,6 +74,10 @@ namespace ams::mitm::ldn {
 
             private:
                 int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
+
+                int ProcessIpv4(const u8 *ip, size_t iplen, void *out, size_t max_size, u32 *out_src_ip);
+
+                const u8 *ReassembleFrag(const u8 *p, size_t n, size_t *out_len);
 
                 /* Hand-built DNS query: libnx getaddrinfo aborts in this sysmodule. */
                 u32 ResolveHostname(const char *host);
@@ -81,6 +90,22 @@ namespace ams::mitm::ldn {
                 bool m_have_nifm_session = false;
                 u32 m_vsrc = 0;
                 u32 m_rsrc = 0;
+
+                static constexpr u32 PingMaxMisses = 4;
+                u32 m_ping_misses = 0;
+                bool m_ping_supported = false;
+
+                static constexpr int FragSlots = 4;
+                struct FragSlot {
+                    bool used;
+                    u16 id;
+                    u32 src;
+                    u8 mask;
+                    u16 total_len;
+                    u8 buffer[1600];
+                };
+                FragSlot m_frags[FragSlots] = {};
+                u8 m_frag_evict = 0;
         };
 
     }

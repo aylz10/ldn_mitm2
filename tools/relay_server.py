@@ -6,6 +6,8 @@ Protocol: UDP datagrams of [u8 type][payload].
   0x00 KEEPALIVE  refreshes this endpoint's mappings; carries no address, so
                   it cannot learn one
   0x01 IPV4       bare IPv4 packet
+  0x02 PING       first 4 bytes echoed back
+  0x03 IPV4_FRAG  16-byte header (src[4] dst[4] ...); forwarded as-is
 
 Routing: learn src IP -> endpoint; broadcasts reach every other client,
 unicast goes to the dst IP's owner. Idle >60s expires.
@@ -18,6 +20,8 @@ import time
 
 TYPE_KEEPALIVE = 0x00
 TYPE_IPV4 = 0x01
+TYPE_PING = 0x02
+TYPE_IPV4_FRAG = 0x03
 IDLE_TIMEOUT = 60.0  # seconds before a silent client is forgotten
 
 
@@ -78,11 +82,21 @@ def main():
                     clients[vsrc] = (ep, now)
             continue
 
-        if msg_type != TYPE_IPV4 or len(payload) < 20:
+        if msg_type == TYPE_PING:
+            try:
+                sock.sendto(data[:4], addr)
+            except OSError:
+                pass
             continue
 
-        src4 = payload[12:16]
-        dst4 = payload[16:20]
+        if msg_type == TYPE_IPV4 and len(payload) >= 20:
+            src4 = payload[12:16]
+            dst4 = payload[16:20]
+        elif msg_type == TYPE_IPV4_FRAG and len(payload) >= 16:
+            src4 = payload[0:4]
+            dst4 = payload[4:8]
+        else:
+            continue
 
         prev = clients.get(src4)
         clients[src4] = (addr, now)
