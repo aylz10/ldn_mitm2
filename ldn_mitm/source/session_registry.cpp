@@ -65,6 +65,7 @@ namespace ams::mitm::ldn {
         int g_rx_head = 0;
         int g_rx_count = 0;
         s32 g_game_fd = -1;
+        u16 g_session_dport = 0;
     }
 
     void GameRx::SetGameFd(s32 fd) {
@@ -96,6 +97,7 @@ namespace ams::mitm::ldn {
         e.sport = sport;
         e.dport = dport;
         e.len = static_cast<u16>(len);
+        g_session_dport = dport;
         std::memcpy(e.data, data, len);
     }
 
@@ -120,6 +122,19 @@ namespace ams::mitm::ldn {
         return g_rx_count > 0;
     }
 
+    void GameRx::NoteSessionPort(u16 port) {
+        if (port == 0) {
+            return;
+        }
+        std::scoped_lock lk(g_rx_mutex);
+        g_session_dport = port;
+    }
+
+    u16 GameRx::SessionDport() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_session_dport;
+    }
+
     u16 GameRx::PeekDport() {
         std::scoped_lock lk(g_rx_mutex);
         if (g_rx_count == 0) {
@@ -133,6 +148,7 @@ namespace ams::mitm::ldn {
         g_rx_count = 0;
         g_rx_head = 0;
         g_game_fd = -1;
+        g_session_dport = 0;
     }
 
 }

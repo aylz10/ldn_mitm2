@@ -739,6 +739,20 @@ namespace ams::mitm::ldn {
             }
         }
 
+        {
+            static u32 s_last_bcast = 0;
+            static int s_last_count = -1;
+            static u32 s_last_peer0 = 0;
+            const u32 peer0 = count > 0 ? peers[0] : 0;
+            if (bcast_ip != s_last_bcast || count != s_last_count || peer0 != s_last_peer0) {
+                s_last_bcast = bcast_ip;
+                s_last_count = count;
+                s_last_peer0 = peer0;
+                LogFormat("diag registry: self %08x bcast %08x peers %d first %08x (nodeCount %d)",
+                    self_ip, bcast_ip, count, peer0, node_count);
+            }
+        }
+
         SessionRegistry::Publish(bcast_ip, peers, count);
     }
 

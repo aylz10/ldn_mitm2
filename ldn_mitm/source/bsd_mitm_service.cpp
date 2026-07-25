@@ -18,6 +18,7 @@
 #include "session_registry.hpp"
 #include "ldnmitm_config.hpp"
 #include "relay_client.hpp"
+#include "tcp_relay.hpp"
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -59,9 +60,170 @@ namespace ams::mitm::ldn {
             return true;
         }
 
+        /* getsockopt, bsd cmd 17. */
+        bool GetForwardSockType(::Service *fwd, s32 sockfd, s32 *out_type) {
+            s32 so_type = 0;
+            const struct { s32 sockfd; u32 level; u32 optname; } in = { sockfd, SOL_SOCKET, SO_TYPE };
+            struct { s32 ret; s32 bsd_errno; u32 optlen; } out = {};
+            const Result rc = serviceDispatchInOut(fwd, 17, in, out,
+                .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out },
+                .buffers = { { std::addressof(so_type), sizeof(so_type) } },
+            );
+            if (R_FAILED(rc) || out.ret != 0 || out.optlen < sizeof(so_type)) {
+                return false;
+            }
+            *out_type = so_type;
+            return true;
+        }
+
+        /* Matched by bound port: games may receive on another socket than they
+           send from. SOCK_DGRAM only, as a TCP socket can share the port. */
+        bool IsGameRecvSocket(::Service *fwd, s32 sockfd) {
+            const u16 want = GameRx::SessionDport();
+            if (want == 0) {
+                return false;
+            }
+            u16 bound = 0;
+            if (!GetForwardBoundPort(fwd, sockfd, std::addressof(bound))) {
+                return false;
+            }
+            if (bound == 0 || bound != want) {
+                return false;
+            }
+            s32 so_type = 0;
+            return GetForwardSockType(fwd, sockfd, std::addressof(so_type)) && so_type == SOCK_DGRAM;
+        }
+
+        /* Any revents counts: errors surface through the verbatim forward. */
+        bool ForwardSocketReadable(::Service *fwd, s32 sockfd) {
+            struct pollfd pfd_in  = { .fd = sockfd, .events = POLLIN, .revents = 0 };
+            struct pollfd pfd_out = pfd_in;
+            const struct { u32 nfds; s32 timeout; } in = { 1, 0 };
+            struct { s32 ret; s32 bsd_errno; } out = {};
+            const Result rc = serviceDispatchInOut(fwd, 6, in, out,
+                .buffer_attrs = {
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                    SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                },
+                .buffers = {
+                    { std::addressof(pfd_in),  sizeof(pfd_in)  },
+                    { std::addressof(pfd_out), sizeof(pfd_out) },
+                },
+            );
+            return R_SUCCEEDED(rc) && out.ret > 0 && pfd_out.revents != 0;
+        }
+
+        /* False means forward verbatim. */
+        bool WaitForGameRx(::Service *fwd, s32 sockfd) {
+            constexpr int WaitSliceMs   = 2;
+            constexpr u32 RealPeekEvery = 12;
+            for (u32 slice = 0; ; slice++) {
+                if (GameRx::HasData()) {
+                    return true;
+                }
+                SessionRegistry::Snapshot snap;
+                SessionRegistry::Get(std::addressof(snap));
+                if (!snap.active) {
+                    return false;
+                }
+                if ((slice % RealPeekEvery) == 0 && ForwardSocketReadable(fwd, sockfd)) {
+                    return false;
+                }
+                svcSleepThread(WaitSliceMs * 1000000L);
+            }
+        }
+
+        /* False means forward verbatim. */
+        bool ServeQueuedPayload(::Service *fwd, s32 sockfd, bool dontwait, const sf::OutAutoSelectBuffer &message,
+                                sf::Out<s32> &ret, sf::Out<s32> &bsd_errno, const char *tag) {
+            if (!IsGameRecvSocket(fwd, sockfd)) {
+                return false;
+            }
+            if (dontwait ? !GameRx::HasData() : !WaitForGameRx(fwd, sockfd)) {
+                return false;
+            }
+
+            size_t out_len = 0;
+            if (!GameRx::Pop(nullptr, nullptr, message.GetPointer(), message.GetSize(), std::addressof(out_len))) {
+                return false;
+            }
+            ret.SetValue(static_cast<s32>(out_len));
+            bsd_errno.SetValue(0);
+
+            static std::atomic<u32> s_served{0};
+            const u32 vn = s_served.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(vn)) {
+                LogFormat("diag %s SERVED #%u fd %d len %zu", tag, vn, sockfd, out_len);
+            }
+            return true;
+        }
+
     }
 
     Result BsdMitmService::Select(sf::Out<s32> ret, sf::Out<s32> bsd_errno, BsdSelectInData in_data, sf::InAutoSelectBuffer rd_in, sf::InAutoSelectBuffer wr_in, sf::InAutoSelectBuffer ex_in, sf::OutAutoSelectBuffer rd_out, sf::OutAutoSelectBuffer wr_out, sf::OutAutoSelectBuffer ex_out) {
+        if (relay::IsEnabled()) {
+            static std::atomic<u32> s_sel{0};
+            const u32 sn = s_sel.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(sn)) {
+                LogFormat("diag Select #%u nfds %d hasdata %d gamefd %d rd_in %zu rd_out %zu",
+                    sn, in_data.nfds, static_cast<int>(GameRx::HasData()), GameRx::GameFd(),
+                    rd_in.GetSize(), rd_out.GetSize());
+            }
+        }
+
+        /* Relay frames never reach the socket: select the real fds without
+           waiting, then mark the game fd readable. */
+        if (relay::IsEnabled() && GameRx::HasData()) {
+            const s32 gfd = GameRx::GameFd();
+            const size_t byte_idx = (gfd >= 0) ? static_cast<size_t>(gfd) / 8 : 0;
+            const u8 bit_mask = static_cast<u8>(1u << (static_cast<u32>(gfd) % 8));
+            if (gfd >= 0 && gfd < in_data.nfds &&
+                rd_in.GetSize() > byte_idx && rd_out.GetSize() > byte_idx) {
+                const auto *rin = static_cast<const u8 *>(rd_in.GetPointer());
+                if (rin[byte_idx] & bit_mask) {
+                    BsdSelectInData in = in_data;
+                    in.is_null = 0;
+                    in.tv_sec  = 0;
+                    in.tv_usec = 0;
+                    BsdOutData out = {};
+                    ::Service *fwd = this->m_forward_service.get();
+                    R_TRY((serviceDispatchInOut(fwd, 5, in, out,
+                        .buffer_attrs = {
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                            SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                        },
+                        .buffers = {
+                            { rd_in.GetPointer(),  rd_in.GetSize()  },
+                            { wr_in.GetPointer(),  wr_in.GetSize()  },
+                            { ex_in.GetPointer(),  ex_in.GetSize()  },
+                            { rd_out.GetPointer(), rd_out.GetSize() },
+                            { wr_out.GetPointer(), wr_out.GetSize() },
+                            { ex_out.GetPointer(), ex_out.GetSize() },
+                        },
+                    )));
+                    if (out.ret >= 0) {
+                        auto *rout = static_cast<u8 *>(rd_out.GetPointer());
+                        if ((rout[byte_idx] & bit_mask) == 0) {
+                            rout[byte_idx] |= bit_mask;
+                            out.ret += 1;
+                        }
+                        static std::atomic<u32> s_wake{0};
+                        const u32 wn = s_wake.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (ShouldLogCapped(wn)) {
+                            LogFormat("diag Select WAKE #%u fd %d ret %d", wn, gfd, out.ret);
+                        }
+                    }
+                    ret.SetValue(out.ret);
+                    bsd_errno.SetValue(out.bsd_errno);
+                    R_SUCCEED();
+                }
+            }
+        }
+
         /* tv_sec is bounded first so the ms conversion cannot overflow. */
         if (in_data.is_null == 0 && in_data.tv_sec >= 0 && in_data.tv_sec <= ForwardMaxMs / 1000) {
             const s64 wait_ms = in_data.tv_sec * 1000 + in_data.tv_usec / 1000;
@@ -129,6 +291,15 @@ namespace ams::mitm::ldn {
     }
 
     Result BsdMitmService::Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out) {
+        if (relay::IsEnabled()) {
+            static std::atomic<u32> s_pl{0};
+            const u32 pn = s_pl.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(pn)) {
+                LogFormat("diag Poll #%u nfds %u timeout %d hasdata %d gamefd %d",
+                    pn, nfds, timeout, static_cast<int>(GameRx::HasData()), GameRx::GameFd());
+            }
+        }
+
         /* Relay frames never reach the socket: re-poll the real fds without
            waiting, then mark the game fd readable. */
         if (relay::IsEnabled() && GameRx::HasData()) {
@@ -227,27 +398,22 @@ namespace ams::mitm::ldn {
     }
 
     Result BsdMitmService::RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr) {
+        if (relay::IsEnabled()) {
+            static std::atomic<u32> s_recv{0};
+            const u32 rn = s_recv.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(rn)) {
+                LogFormat("diag RecvFrom #%u fd %d gamefd %d hasdata %d peek %d addrlen %zu",
+                    rn, sockfd, GameRx::GameFd(), static_cast<int>(GameRx::HasData()),
+                    static_cast<int>((flags & MSG_PEEK) != 0), src_addr.GetSize());
+            }
+        }
+
         if (relay::IsEnabled() &&
             (flags & MSG_PEEK) == 0 &&
             src_addr.GetSize() >= sizeof(struct sockaddr_in) &&
-            GameRx::HasData()) {
-
-            /* Latch only the socket bound to the queued frame's dst port. */
-            if (GameRx::GameFd() < 0) {
-                u16 bound_port = 0;
-                if (GetForwardBoundPort(this->m_forward_service.get(), sockfd, std::addressof(bound_port)) &&
-                    bound_port != 0 && bound_port == GameRx::PeekDport()) {
-                    GameRx::SetGameFd(sockfd);
-                    LogFormat("bsd RecvFrom: bootstrapped game fd %d (bound port %u) from recv", sockfd, bound_port);
-                } else {
-                    LogFormat("bsd RecvFrom: fd %d bound port %u != queued dport %u, not latching",
-                        sockfd, bound_port, GameRx::PeekDport());
-                }
-            }
-
-            if (sockfd != GameRx::GameFd()) {
-                R_RETURN(sm::mitm::ResultShouldForwardToSession());
-            }
+            IsGameRecvSocket(this->m_forward_service.get(), sockfd) &&
+            ((flags & MSG_DONTWAIT) != 0 ? GameRx::HasData()
+                                         : WaitForGameRx(this->m_forward_service.get(), sockfd))) {
 
             u32 src_ip = 0; u16 sport = 0; size_t out_len = 0;
             if (GameRx::Pop(&src_ip, &sport, message.GetPointer(), message.GetSize(), &out_len)) {
@@ -261,8 +427,78 @@ namespace ams::mitm::ldn {
                 bsd_errno.SetValue(0);
                 addrlen.SetValue(static_cast<u32>(sizeof(sa)));
 
+                {
+                    static std::atomic<u32> s_served{0};
+                    const u32 vn = s_served.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (ShouldLogCapped(vn)) {
+                        LogFormat("diag RecvFrom SERVED #%u fd %d src %08x:%u len %zu", vn, sockfd, src_ip, sport, out_len);
+                    }
+                }
+
                 R_SUCCEED();
             }
+        }
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result BsdMitmService::Recv(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message) {
+        if (relay::IsEnabled()) {
+            static std::atomic<u32> s_recv{0};
+            const u32 rn = s_recv.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(rn)) {
+                LogFormat("diag Recv #%u fd %d gamefd %d hasdata %d peek %d",
+                    rn, sockfd, GameRx::GameFd(), static_cast<int>(GameRx::HasData()),
+                    static_cast<int>((flags & MSG_PEEK) != 0));
+            }
+        }
+
+        if (relay::IsEnabled() && (flags & MSG_PEEK) == 0 &&
+            ServeQueuedPayload(this->m_forward_service.get(), sockfd, (flags & MSG_DONTWAIT) != 0,
+                               message, ret, bsd_errno, "Recv")) {
+            R_SUCCEED();
+        }
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result BsdMitmService::Connect(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, sf::InAutoSelectBuffer dst_addr) {
+        if (relay::IsEnabled() && dst_addr.GetSize() >= sizeof(struct sockaddr_in)) {
+            const auto *sa = reinterpret_cast<const struct sockaddr_in *>(dst_addr.GetPointer());
+            if (sa->sin_family == AF_INET) {
+                const u32 ip   = ntohl(sa->sin_addr.s_addr);
+                const u16 port = ntohs(sa->sin_port);
+                s32 so_type = 0;
+                if (GetForwardSockType(this->m_forward_service.get(), sockfd, std::addressof(so_type)) &&
+                    so_type == SOCK_STREAM) {
+                    s32 r = 0, e = 0;
+                    if (tcprelay::RedirectConnect(this->m_forward_service.get(), sockfd, ip, port,
+                                                  std::addressof(r), std::addressof(e))) {
+                        ret.SetValue(r);
+                        bsd_errno.SetValue(e);
+                        R_SUCCEED();
+                    }
+                }
+            }
+        }
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result BsdMitmService::Read(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, sf::OutAutoSelectBuffer message) {
+        if (relay::IsEnabled()) {
+            static std::atomic<u32> s_rd{0};
+            const u32 rn = s_rd.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogCapped(rn)) {
+                LogFormat("diag Read #%u fd %d gamefd %d hasdata %d",
+                    rn, sockfd, GameRx::GameFd(), static_cast<int>(GameRx::HasData()));
+            }
+        }
+
+        if (relay::IsEnabled() &&
+            ServeQueuedPayload(this->m_forward_service.get(), sockfd, false,
+                               message, ret, bsd_errno, "Read")) {
+            R_SUCCEED();
         }
 
         R_RETURN(sm::mitm::ResultShouldForwardToSession());
@@ -284,10 +520,21 @@ namespace ams::mitm::ldn {
 
                 const bool is_bcast = (ip == 0xFFFFFFFFu) || (snap.active && ip == snap.bcast_ip);
 
+                {
+                    static std::atomic<u32> s_sendto{0};
+                    const u32 sn = s_sendto.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (ShouldLogCapped(sn)) {
+                        LogFormat("diag SendTo #%u fd %d dst %08x:%u len %zu bcast %d | active %d peers %d bcast_ip %08x",
+                            sn, sockfd, ip, port, message.GetSize(), static_cast<int>(is_bcast),
+                            static_cast<int>(snap.active), snap.peer_count, snap.bcast_ip);
+                    }
+                }
+
                 if (want_relay && snap.active && !is_bcast && ip != 0 && ip != 0x7F000001u) {
                     for (int i = 0; i < snap.peer_count; i++) {
                         if (ip == snap.peer_ips[i]) {
                             GameRx::SetGameFd(sockfd);
+                            GameRx::NoteSessionPort(port);
                             relay::BridgeSendGameUnicast(message.GetPointer(), message.GetSize(), port, ip);
                             break;
                         }
@@ -321,6 +568,7 @@ namespace ams::mitm::ldn {
 
                     if (want_relay) {
                         GameRx::SetGameFd(sockfd);
+                        GameRx::NoteSessionPort(port);
                         relay::BridgeSendGameBroadcast(message.GetPointer(), message.GetSize(), port);
                     }
                 }

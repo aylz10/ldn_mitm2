@@ -47,6 +47,9 @@ namespace ams::mitm::ldn {
             Result Select(sf::Out<s32> ret, sf::Out<s32> bsd_errno, BsdSelectInData in_data, sf::InAutoSelectBuffer rd_in, sf::InAutoSelectBuffer wr_in, sf::InAutoSelectBuffer ex_in, sf::OutAutoSelectBuffer rd_out, sf::OutAutoSelectBuffer wr_out, sf::OutAutoSelectBuffer ex_out);
             Result Poll(sf::Out<s32> ret, sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, sf::InAutoSelectBuffer fds_in, sf::OutAutoSelectBuffer fds_out);
             Result RecvFrom(sf::Out<s32> ret, sf::Out<s32> bsd_errno, sf::Out<u32> addrlen, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message, sf::OutAutoSelectBuffer src_addr);
+            Result Recv(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, u32 flags, sf::OutAutoSelectBuffer message);
+            Result Read(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, sf::OutAutoSelectBuffer message);
+            Result Connect(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, sf::InAutoSelectBuffer dst_addr);
             Result SendTo(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, sf::InAutoSelectBuffer message, sf::InAutoSelectBuffer dst_addr);
     };
     static_assert(ams::mitm::ldn::IsIBsdMitmInterface<BsdMitmService>);

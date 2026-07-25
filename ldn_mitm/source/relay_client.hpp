@@ -75,6 +75,8 @@ namespace ams::mitm::ldn {
             private:
                 int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
 
+                int SendFragmented(u32 src, u32 dst, const u8 *packet, size_t total);
+
                 int ProcessIpv4(const u8 *ip, size_t iplen, void *out, size_t max_size, u32 *out_src_ip);
 
                 const u8 *ReassembleFrag(const u8 *p, size_t n, size_t *out_len);
@@ -88,6 +90,7 @@ namespace ams::mitm::ldn {
                 NifmRequest m_req{};
                 bool m_have_req = false;
                 bool m_have_nifm_session = false;
+                u16 m_frag_send_id = 0;
                 u32 m_vsrc = 0;
                 u32 m_rsrc = 0;
 

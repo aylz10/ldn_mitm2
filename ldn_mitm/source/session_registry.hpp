@@ -54,6 +54,12 @@ namespace ams::mitm::ldn {
             /* dport of the oldest queued frame, 0 if empty. */
             static u16 PeekDport();
 
+            /* dport of the last pushed frame; kept after the queue drains, 0
+               after Clear. Identifies the game's receive socket by bound port. */
+            static u16 SessionDport();
+
+            static void NoteSessionPort(u16 port);
+
             static bool HasData();
 
             static void Clear();

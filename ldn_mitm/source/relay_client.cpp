@@ -19,6 +19,7 @@
 #include "nifm_manager.hpp"
 #include "session_registry.hpp"
 #include "ldnmitm_config.hpp"
+#include "tcp_relay.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -41,8 +42,9 @@ namespace ams::mitm::ldn::relay {
         constexpr u8 TypePing      = 0x02;
         constexpr u8 TypeIpv4Frag  = 0x03;
 
-        /* 1500 MTU minus relay type, IP and UDP headers. */
-        constexpr size_t MaxWrapPayload = 1500 - 1 - 20 - 8;
+        /* 1500 MTU minus IP/UDP headers. */
+        constexpr size_t MaxWrapPayload = 1472;
+        constexpr size_t SingleFrameMax = 1500;
 
         u16 IpChecksum(const u8 *d, size_t n) {
             u32 s = 0;
@@ -478,11 +480,14 @@ namespace ams::mitm::ldn::relay {
         }
 
         this->SendKeepalive();
+        tcprelay::Start();
         LogFormat("relay xport: open, vsrc=%08x rsrc=%08x fd=%d", m_vsrc, m_rsrc, m_fd);
         R_SUCCEED();
     }
 
     void RelayTransport::Close() {
+        /* Stop before unpublishing: it sends tunnel closes through the bridge. */
+        tcprelay::Stop();
         /* Unpublish before closing: bridge sends run under g_bridge_mutex. */
         {
             std::scoped_lock lk(g_bridge_mutex);
@@ -530,7 +535,7 @@ namespace ams::mitm::ldn::relay {
     }
 
     int RelayTransport::SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len) {
-        u8 buf[1500];
+        u8 buf[1 + 20 + 8 + MaxWrapPayload];
         const u16 udplen = static_cast<u16>(8 + len);
         const u16 total  = static_cast<u16>(20 + udplen);
         buf[0] = TypeIpv4;
@@ -550,7 +555,46 @@ namespace ams::mitm::ldn::relay {
         udp[4] = udplen >> 8; udp[5] = udplen & 0xff;
         udp[6] = 0; udp[7] = 0;
         std::memcpy(udp + 8, payload, len);
+
+        if (static_cast<size_t>(total) + 1 > SingleFrameMax) {
+            return this->SendFragmented(src, dst, ip, total);
+        }
         return send(m_fd, buf, 1 + total, 0);
+    }
+
+    int RelayTransport::SendFragmented(u32 src, u32 dst, const u8 *packet, size_t total) {
+        constexpr u16 Pmtu = 1024;
+        const u8 parts = static_cast<u8>((total + Pmtu - 1) / Pmtu);
+        if (parts == 0 || parts > 8) {   /* the receiver's completion mask is 8 bits */
+            return -1;
+        }
+        const u16 id = m_frag_send_id++;
+        int last = -1;
+        for (u8 part = 0; part < parts; part++) {
+            const size_t off   = static_cast<size_t>(Pmtu) * part;
+            const size_t remaining = total - off;
+            const size_t chunk = remaining < static_cast<size_t>(Pmtu) ? remaining : static_cast<size_t>(Pmtu);
+
+            u8 f[1 + 16 + Pmtu];
+            f[0] = TypeIpv4Frag;
+            u8 *h = f + 1;
+            h[0] = (src >> 24) & 0xff; h[1] = (src >> 16) & 0xff;
+            h[2] = (src >> 8) & 0xff;  h[3] = src & 0xff;
+            h[4] = (dst >> 24) & 0xff; h[5] = (dst >> 16) & 0xff;
+            h[6] = (dst >> 8) & 0xff;  h[7] = dst & 0xff;
+            h[8] = id >> 8; h[9] = id & 0xff;
+            h[10] = part;
+            h[11] = parts;
+            h[12] = static_cast<u8>(chunk >> 8); h[13] = static_cast<u8>(chunk & 0xff);
+            h[14] = Pmtu >> 8; h[15] = Pmtu & 0xff;
+            std::memcpy(h + 16, packet + off, chunk);
+
+            last = send(m_fd, f, 1 + 16 + chunk, 0);
+            if (last < 0) {
+                return last;
+            }
+        }
+        return last;
     }
 
     int RelayTransport::SendBroadcast(const void *lan_packet, size_t size) {
@@ -590,15 +634,24 @@ namespace ams::mitm::ldn::relay {
         }
         const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
 
+        static std::atomic<u32> s_inject{0};
+        const u32 in = s_inject.fetch_add(1, std::memory_order_relaxed) + 1;
+        const bool diag = (in <= 8 || (in % 256) == 0);
+
         if (src == m_rsrc) {
+            if (diag) { LogFormat("diag inject #%u DROP own-echo src %08x", in, src); }
             return;
         }
         SessionRegistry::Snapshot snap;
         SessionRegistry::Get(&snap);
         if (!snap.active) {
+            if (diag) { LogFormat("diag inject #%u DROP session-inactive src %08x dport %u", in, src, dport); }
             return;
         }
 
+        if (diag) {
+            LogFormat("diag inject #%u PUSH src %08x sport %u dport %u len %zu", in, src, sport, dport, plen);
+        }
         /* The local stack cannot deliver a foreign source IP; bsd:u RecvFrom
            serves it from GameRx instead. */
         GameRx::Push(src, sport, dport, payload, plen);
@@ -704,6 +757,15 @@ namespace ams::mitm::ldn::relay {
             return 0;
         }
         const u16 dport = (udp[2] << 8) | udp[3];
+        if (dport == tcprelay::TcpTunnelPort) {
+            const u8 *tp = udp + 8;
+            const size_t tlen = static_cast<size_t>((ip + iplen) - tp);
+            const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
+            if (tlen > 0 && src != m_rsrc) {
+                tcprelay::OnTunnelFrame(src, tp, tlen);
+            }
+            return 0;
+        }
         if (dport != 11452) { /* LANDiscovery::DefaultPort */
             this->InjectGameFrame(ip, iplen);
             return 0;
