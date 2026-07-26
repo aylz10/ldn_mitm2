@@ -3,8 +3,6 @@ NROS := ldnmitm_config
 
 SUBFOLDERS := Atmosphere-libs/libstratosphere $(KIPS) $(NROS) overlay
 
-TOPTARGETS := all clean
-
 OUTDIR		:=	out
 SD_ROOT     :=  $(OUTDIR)/sd
 NRO_DIR     :=  $(SD_ROOT)/switch/ldnmitm_config
@@ -13,7 +11,22 @@ OVERLAY_DIR :=  $(SD_ROOT)/switch/.overlays
 
 ATMOSPHERE_PATCH := docs/atmosphere-libs-mitm-domain-id-collision.patch
 
-$(TOPTARGETS): PACK
+# libstratosphere miscompiles under gcc >= 16 (the console wedges when an LDN
+# session ends). Build with devkitA64 r29.2 / gcc 15.2.0.
+GCC_PREFIX := $(if $(PREFIX),$(PREFIX),aarch64-none-elf-)
+GCC_MAJOR := $(shell ($(GCC_PREFIX)gcc -dumpversion 2>/dev/null || $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-gcc -dumpversion 2>/dev/null) | cut -d. -f1)
+ifeq ($(shell test "$(GCC_MAJOR)" -ge 16 2>/dev/null && echo yes),yes)
+$(warning ==========================================================)
+$(warning gcc $(GCC_MAJOR) detected. libstratosphere miscompiles with)
+$(warning gcc >= 16 - LDN sessions freeze the console when they end.)
+$(warning Use devkitA64 r29.2 / gcc 15.2.0.)
+$(warning ==========================================================)
+endif
+
+all: PACK
+
+clean: $(SUBFOLDERS)
+	@ rm -rf $(OUTDIR)
 
 $(SUBFOLDERS):
 	$(MAKE) -C $@ $(MAKECMDGOALS)
@@ -44,4 +57,4 @@ PACK: $(SUBFOLDERS)
 	@ touch $(TITLE_DIR)/flags/boot2.flag
 #---------------------------------------------------------------------------------
 
-.PHONY: $(TOPTARGETS) $(SUBFOLDERS)
+.PHONY: all clean PACK atmosphere-patch $(SUBFOLDERS)

@@ -26,8 +26,8 @@ This fork adds two things that let you play LDN games with players elsewhere
   relay server. The console speaks the lan-play protocol directly. You point it
   at a relay server and it behaves like everyone is on the same LAN.
 
-Everything is controlled from the **Tesla overlay** (bundled). None of it
-changes normal local LDN unless you turn it on.
+Everything is controlled from the **Tesla overlay** (bundled). The broadcast
+relay is on by default; the internet relay stays off until you turn it on.
 
 ## Configuration
 
@@ -90,11 +90,16 @@ Notes:
   latency and jitter versus Wi-Fi.
 
 Limitations:
+- **Turn the relay off when both consoles are on the same LAN.** It is meant
+  for players on different networks, and using it on one LAN delivers every
+  packet *twice* — once directly over the LAN, once through the relay — because
+  the peer is reachable both ways. Games differ in how they take that: Rayman
+  Legends plays fine, while a Pokémon Let's Go link trade hangs partway through.
+  The same trade works with the relay off on one LAN, and works with the relay
+  on across two networks. A future update will suppress the redundant copy.
 - Internet play is validated for two consoles on different networks. More than
   two, or a mix where some consoles share a LAN and others are remote, is not
-  yet tested — it should still connect, but two consoles on the *same* LAN will
-  redundantly round-trip their traffic through the relay instead of talking
-  directly, which may add jitter. A future update will suppress that.
+  yet tested.
 
 ## Fixes and improvements in this fork
 

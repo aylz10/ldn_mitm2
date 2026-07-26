@@ -77,3 +77,19 @@ make.bat
 
 # overlay
 *.ovl
+
+# Session artifacts
+scratchpad/
+log_archive/
+erpt_reports/
+bsd-mitm-repro/
+__pycache__/
+
+# Local relay config (template: docs/relay.cfg.example)
+tools/relay.cfg
+
+# Working notes
+docs/bsd-mitm-plan.md
+docs/internet-relay-plan.md
+docs/tcp-relay-plan.md
+docs/release-notes.md

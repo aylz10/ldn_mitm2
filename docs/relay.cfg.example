@@ -7,7 +7,10 @@
 #broadcast=1
 # active server, by name
 #selected=my-pc
+# this console's relay address (10.13.x.x); random on first use,
+# change only if another player has the same one
+#id=41237
 
-my-pc        82.65.234.243:11455
-lan-play     104.238.152.86
-public       relay.example.com
+my-pc     203.0.113.10:11455
+lan-play  104.238.152.86
+public    relay.example.com

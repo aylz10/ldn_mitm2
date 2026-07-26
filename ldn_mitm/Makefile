@@ -14,9 +14,10 @@ TARGET_VERSION := $(shell git describe --tags)$(shell git diff --quiet --ignore-
 #---------------------------------------------------------------------------------
 VERSION_DEFINES	:= -DGITDESCVER="\"${TARGET_VERSION}\""
 
+EXTRA_FLAGS	?=
 
-CFLAGS		+= $(VERSION_DEFINES)
-CXXFLAGS	+= $(VERSION_DEFINES)
+CFLAGS		+= $(VERSION_DEFINES) $(EXTRA_FLAGS)
+CXXFLAGS	+= $(VERSION_DEFINES) $(EXTRA_FLAGS)
 
 #---------------------------------------------------------------------------------
 # no real need to edit anything past this point unless you need to add additional
