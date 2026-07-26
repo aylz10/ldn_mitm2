@@ -199,7 +199,7 @@ ssize_t TcpLanSocketBase::recvfrom(void *buf, size_t len, struct sockaddr_in *ad
 	AMS_UNUSED(addr);
     auto rc = ::recvfrom(this->fd, buf, len, 0, nullptr, 0);
     if (rc == 0) {
-        return -0xFD23;
+        return LanSocketPeerClosed;
     }
     return rc;
 }

@@ -118,6 +118,7 @@ namespace ams::mitm::ldn {
         if (n <= 0) {
             return n;
         }
+        this->lastSrc = src;
         if (addr) {
             addr->sin_family = AF_INET;
             addr->sin_port = htons(11452);
@@ -153,6 +154,8 @@ namespace ams::mitm::ldn {
                     if (size != sizeof(*info)) {
                         break;
                     }
+                    /* nodes[0] is the host's real IP; lastSrc is its relay address. */
+                    this->transport.LearnPeer(info->ldn.nodes[0].ipv4Address, this->lastSrc);
                     std::scoped_lock lock(this->discovery->dataMutex);
                     if (this->discovery->joinActive &&
                         info->common.bssid == this->discovery->joinBssid) {
@@ -173,6 +176,7 @@ namespace ams::mitm::ldn {
                     if (size != sizeof(*info)) {
                         break;
                     }
+                    this->transport.LearnPeer(info->ipv4Address, this->lastSrc);
                     if (this->discovery->getState() == CommState::AccessPointCreated) {
                         LogFormat("relay: got Connect from %08x", info->ipv4Address);
                         this->discovery->onRelayConnect(info);
@@ -184,6 +188,7 @@ namespace ams::mitm::ldn {
                     if (size != sizeof(*info)) {
                         break;
                     }
+                    this->transport.LearnPeer(info->ldn.nodes[0].ipv4Address, this->lastSrc);
                     if (this->discovery->getState() == CommState::Station ||
                         this->discovery->getState() == CommState::StationConnected) {
                         LogFormat("relay: got SyncNetwork");
@@ -196,6 +201,8 @@ namespace ams::mitm::ldn {
                     if (size != sizeof(*hb)) {
                         break;
                     }
+                    /* Learned in every state: keeps station-to-station mappings fresh. */
+                    this->transport.LearnPeer(hb->ipv4, this->lastSrc);
                     if (this->discovery->getState() == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->discovery->dataMutex);
                         if (hb->bssid == this->discovery->networkInfo.common.bssid) {
@@ -204,6 +211,47 @@ namespace ams::mitm::ldn {
                                     st.getFd() < 0 &&
                                     st.nodeInfo->ipv4Address == hb->ipv4) {
                                     st.lastSeen = os::GetSystemTick();
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                case LANPacketType::RelayBye: {
+                    const RelayHeartbeatPayload *bye = (decltype(bye))data;
+                    if (size != sizeof(*bye)) {
+                        break;
+                    }
+                    const auto state = this->discovery->getState();
+                    if (state == CommState::StationConnected) {
+                        bool host_left = false;
+                        {
+                            std::scoped_lock lock(this->discovery->dataMutex);
+                            host_left = this->discovery->joinActive &&
+                                bye->bssid == this->discovery->joinBssid &&
+                                bye->ipv4 == this->discovery->networkInfo.ldn.nodes[0].ipv4Address;
+                        }
+                        if (host_left) {
+                            LogFormat("relay: host Bye (%08x), ending session", bye->ipv4);
+                            this->discovery->onDisconnectFromHost(DisconnectReason::DestroyedByUser);
+                        }
+                    } else if (state == CommState::AccessPointCreated) {
+                        bool changed = false;
+                        {
+                            std::scoped_lock lock(this->discovery->dataMutex);
+                            if (bye->bssid == this->discovery->networkInfo.common.bssid) {
+                                for (auto &st : this->discovery->stations) {
+                                    if (st.getStatus() == NodeStatus::Connected &&
+                                        st.getFd() < 0 &&
+                                        st.nodeInfo->ipv4Address == bye->ipv4) {
+                                        LogFormat("relay: station %d Bye (%08x), dropping",
+                                            st.nodeId, bye->ipv4);
+                                        st.reset();
+                                        changed = true;
+                                    }
+                                }
+                                if (changed) {
+                                    this->discovery->updateNodes();
                                 }
                             }
                         }
@@ -222,7 +270,7 @@ namespace ams::mitm::ldn {
         LogFormat("LDTcpSocket::onRead");
         const auto state = this->discovery->getState();
         if (state == CommState::Station || state == CommState::StationConnected) {
-            return this->recvPacket([&](LANPacketType type, const void *data, size_t size, ReplyFunc reply) -> int {
+            const int rc = this->recvPacket([&](LANPacketType type, const void *data, size_t size, ReplyFunc reply) -> int {
 				AMS_UNUSED(reply);
                 if (type == LANPacketType::SyncNetwork) {
                     LogFormat("SyncNetwork");
@@ -239,6 +287,9 @@ namespace ams::mitm::ldn {
 
                 return 0;
             });
+            /* A clean FIN means the host destroyed the network. */
+            this->hostClosed = (rc == LanSocketPeerClosed);
+            return rc;
         } else if (state == CommState::AccessPointCreated) {
             struct sockaddr_in addr;
             socklen_t addrlen = sizeof(addr);
@@ -259,7 +310,8 @@ namespace ams::mitm::ldn {
     void LDTcpSocket::onClose() {
         LogFormat("LDTcpSocket::onClose");
         this->close();
-        this->discovery->onDisconnectFromHost();
+        this->discovery->onDisconnectFromHost(
+            this->hostClosed ? DisconnectReason::DestroyedByUser : DisconnectReason::SignalLost);
     }
 
     u32 LDUdpSocket::getBroadcast() {
@@ -304,6 +356,7 @@ namespace ams::mitm::ldn {
             }
             if (present) {
                 this->setState(CommState::StationConnected);
+                this->sendRelayScope();
             } else {
                 LogFormat("onSyncNetwork: host has not registered us yet, still connecting");
             }
@@ -369,14 +422,62 @@ namespace ams::mitm::ldn {
         LogFormat("relay: no free station slot");
     }
 
-    void LANDiscovery::onDisconnectFromHost() {
-        LogFormat("onDisconnectFromHost state: %d", static_cast<int>(this->state));
+    namespace {
+        /* FNV-1a over the session id, as tools/relay_server.py expects.
+           0 is reserved for "no session". */
+        u32 SessionScopeToken(const NetworkInfo &info) {
+            const u8 *b = reinterpret_cast<const u8 *>(std::addressof(info.networkId.sessionId));
+            u32 h = 0x811c9dc5u;
+            for (size_t i = 0; i < sizeof(SessionId); i++) {
+                h = (h ^ b[i]) * 0x01000193u;
+            }
+            return h != 0 ? h : 1;
+        }
+    }
+
+    void LANDiscovery::sendRelayScope() {
+        if (!this->relay) {
+            return;
+        }
+        u32 scope = 0;
+        {
+            std::scoped_lock lock(this->dataMutex);
+            if (this->state == CommState::AccessPointCreated ||
+                this->state == CommState::StationConnected) {
+                scope = SessionScopeToken(this->networkInfo);
+            }
+        }
+        this->relay->sendScope(scope);
+    }
+
+    void LANDiscovery::sendRelayBye() {
+        if (!this->relay) {
+            return;
+        }
+        std::scoped_lock lock(this->dataMutex);
+        RelayHeartbeatPayload bye = {};
+        if (this->state == CommState::AccessPointCreated) {
+            bye.bssid = this->networkInfo.common.bssid;
+            bye.ipv4  = this->networkInfo.ldn.nodes[0].ipv4Address;
+        } else if (this->relayJoined) {
+            bye.bssid = this->joinBssid;
+            bye.ipv4  = this->relayJoinedIp;
+        } else {
+            return;
+        }
+        LogFormat("relay: sending Bye (%08x)", bye.ipv4);
+        this->relay->send(LANPacketType::RelayBye, &bye, sizeof(bye));
+    }
+
+    void LANDiscovery::onDisconnectFromHost(DisconnectReason reason) {
+        LogFormat("onDisconnectFromHost state: %d reason: %d",
+            static_cast<int>(this->state), static_cast<int>(reason));
         if (this->state == CommState::StationConnected) {
             {
                 std::scoped_lock lock(this->dataMutex);
                 this->relayJoined = false;
             }
-            this->disconnect_reason = DisconnectReason::SignalLost;
+            this->disconnect_reason = reason;
             this->setState(CommState::Station);
         }
     }
@@ -814,6 +915,8 @@ namespace ams::mitm::ldn {
                         this->relay->keepalive();
                     }
 
+                    this->sendRelayScope();
+
                     if (this->relay->pathDead()) {
                         if (os::ConvertToTimeSpan(now - this->lastRelayReconnect).GetMilliSeconds() >= RelayReconnectMinIntervalMs) {
                             this->lastRelayReconnect = now;
@@ -851,7 +954,7 @@ namespace ams::mitm::ldn {
                         if (host_lost) {
                             LogFormat("relay: host silent > %ds, disconnecting",
                                 static_cast<int>(RelayPeerTimeoutMs / 1000));
-                            this->onDisconnectFromHost();
+                            this->onDisconnectFromHost(DisconnectReason::SignalLost);
                         }
                     }
                 }
@@ -978,6 +1081,7 @@ namespace ams::mitm::ldn {
         }
 
         this->setState(CommState::AccessPointCreated);
+        this->sendRelayScope();
 
         this->initNodeStateChange();
         node0->isConnected = 1;
@@ -987,6 +1091,7 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::destroyNetwork() {
+        this->sendRelayBye();
         SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1002,6 +1107,7 @@ namespace ams::mitm::ldn {
     }
 
     Result LANDiscovery::disconnect() {
+        this->sendRelayBye();
         SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1058,6 +1164,7 @@ namespace ams::mitm::ldn {
             return MAKERESULT(LdnModuleId, 32);
         }
 
+        this->sendRelayBye();
         SessionRegistry::Clear();
         {
             std::scoped_lock lock(this->pollMutex);
@@ -1300,7 +1407,9 @@ namespace ams::mitm::ldn {
         if (this->initialized) {
             SessionRegistry::Clear();
             this->stop = true;
+            LogFormat("finalize: waiting for worker");
             os::WaitThread(&this->workerThread);
+            LogFormat("finalize: worker joined");
             os::DestroyThread(&this->workerThread);
             this->udp.reset();
             this->tcp.reset();
@@ -1359,6 +1468,7 @@ namespace ams::mitm::ldn {
 
         originalMtu = networkProfile.ip_setting_data.mtu;
         /* A low profile MTU breaks pia games (2618-0006). */
+        LogFormat("profile MTU %d", originalMtu);
         int desiredMtu = originalMtu;
         if (desiredMtu == 0 || desiredMtu > 1500) {
             desiredMtu = 1500;

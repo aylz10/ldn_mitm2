@@ -8,10 +8,14 @@ enum class LANPacketType : u8 {
     Connect,
     SyncNetwork,
     RelayHeartbeat,
+    /* Same payload as RelayHeartbeat. */
+    RelayBye,
 };
 
 typedef std::function<int(LANPacketType, const void *, size_t)> ReplyFunc;
 typedef std::function<int(LANPacketType, const void *, size_t, ReplyFunc)> MessageCallback;
+
+constexpr int LanSocketPeerClosed = -0xFD23;
 
 class Pollable {
     public:

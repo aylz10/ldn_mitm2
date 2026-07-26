@@ -41,6 +41,15 @@ namespace ams::mitm::ldn::relay {
         constexpr u8 TypeIpv4      = 0x01;
         constexpr u8 TypePing      = 0x02;
         constexpr u8 TypeIpv4Frag  = 0x03;
+        /* ldn_mitm extension (tools/relay_server.py): [u32 BE session token]. */
+        constexpr u8 TypeScope     = 0x20;
+
+        /* IP header id of our wrapped frames; the receiver dispatches on it. */
+        constexpr u16 IpIdControl = 0x4243;   /* LANDiscovery packets */
+        constexpr u16 IpIdGame    = 0x474D;   /* addressed by real IPs */
+        constexpr u16 IpIdGameV2  = 0x474E;   /* addressed by vsrc, real IPs in the shim */
+        /* IpIdGameV2 shim: real src + real dst (BE) ahead of the game payload. */
+        constexpr size_t GameShimLen = 8;
 
         /* 1500 MTU minus IP/UDP headers. */
         constexpr size_t MaxWrapPayload = 1472;
@@ -66,6 +75,8 @@ namespace ams::mitm::ldn::relay {
         int g_count = 0;
         std::atomic_int  g_selected{0};
         std::atomic_bool g_enabled{false};
+        /* Low 16 bits of our virtual address 10.13.x.x; 0 = unassigned. */
+        std::atomic<u16> g_client_id{0};
     }
 
     namespace {
@@ -87,7 +98,13 @@ namespace ams::mitm::ldn::relay {
         bool IsDirectiveLine(const char *l) {
             return DirectiveValue(l, "enabled")   != nullptr ||
                    DirectiveValue(l, "broadcast") != nullptr ||
-                   DirectiveValue(l, "selected")  != nullptr;
+                   DirectiveValue(l, "selected")  != nullptr ||
+                   DirectiveValue(l, "id")        != nullptr;
+        }
+
+        /* Reserved: 0, x.0, x.255, and 37.x (common hand-picked lan-play range). */
+        bool BadClientId(u16 id) {
+            return id == 0 || (id & 0xFF) == 0xFF || (id & 0xFF) == 0x00 || (id >> 8) == 37;
         }
 
         void ReadConfigFile(char *buf, size_t cap) {
@@ -112,6 +129,7 @@ namespace ams::mitm::ldn::relay {
         g_count = 0;
         g_selected = 0;
         g_enabled = false;
+        g_client_id = 0;
         char pending_selected[ServerNameLen] = {};
 
         char buf[1024];
@@ -131,6 +149,13 @@ namespace ams::mitm::ldn::relay {
             }
             if (const char *v = DirectiveValue(line, "broadcast")) {
                 LdnConfig::setBroadcastRelay(std::atoi(v) != 0);
+                continue;
+            }
+            if (const char *v = DirectiveValue(line, "id")) {
+                const long n = std::strtol(v, nullptr, 10);
+                if (n > 0 && n < 0xFFFF && !BadClientId(static_cast<u16>(n))) {
+                    g_client_id = static_cast<u16>(n);
+                }
                 continue;
             }
             if (const char *v = DirectiveValue(line, "selected")) {
@@ -196,6 +221,10 @@ namespace ams::mitm::ldn::relay {
             char out[1280];
             size_t pos = static_cast<size_t>(std::snprintf(out, sizeof(out), "enabled=%d\nbroadcast=%d\n",
                 g_enabled.load() ? 1 : 0, LdnConfig::getBroadcastRelay() ? 1 : 0));
+            if (const u16 id = g_client_id.load(); id != 0) {
+                pos += static_cast<size_t>(std::snprintf(out + pos, sizeof(out) - pos,
+                    "id=%u\n", id));
+            }
             const int sel = g_selected.load();
             if (sel >= 0 && sel < g_count) {
                 pos += static_cast<size_t>(std::snprintf(out + pos, sizeof(out) - pos,
@@ -232,6 +261,25 @@ namespace ams::mitm::ldn::relay {
                 LogFormat("relay: persisting settings failed (write)");
             }
             fs::CloseFile(f);
+        }
+
+        u16 EnsureClientId() {
+            u16 id = g_client_id.load();
+            if (id == 0) {
+                u16 fresh;
+                do {
+                    os::GenerateRandomBytes(std::addressof(fresh), sizeof(fresh));
+                } while (BadClientId(fresh));
+                u16 expected = 0;
+                if (g_client_id.compare_exchange_strong(expected, fresh)) {
+                    id = fresh;
+                    PersistConfig();
+                    LogFormat("relay: assigned virtual address 10.13.%u.%u", (id >> 8) & 0xff, id & 0xff);
+                } else {
+                    id = expected;
+                }
+            }
+            return id;
         }
     }
 
@@ -411,16 +459,9 @@ namespace ams::mitm::ldn::relay {
             svcSleepThread(500000000L);
         }
 
-        /* Virtual src 10.13.<ip3>.<ip4>; game frames carry the real IP. */
         u32 ip = 0;
-        if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ip))) {
-            ip = ntohl(ip);
-            m_rsrc = ip;
-            m_vsrc = (10u << 24) | (13u << 16) | (((ip >> 8) & 0xff) << 8) | (ip & 0xff);
-        } else {
-            m_rsrc = 0;
-            m_vsrc = (10u << 24) | (13u << 16) | 0x0001;
-        }
+        m_vsrc = (10u << 24) | (13u << 16) | EnsureClientId();
+        m_rsrc = R_SUCCEEDED(nifmGetCurrentIpAddress(&ip)) ? ntohl(ip) : 0;
 
         u32 server_ip = ServerIp();
         if (server_ip == 0) {
@@ -535,7 +576,7 @@ namespace ams::mitm::ldn::relay {
     }
 
     int RelayTransport::SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len) {
-        u8 buf[1 + 20 + 8 + MaxWrapPayload];
+        u8 buf[1 + 20 + 8 + MaxWrapPayload + GameShimLen];
         const u16 udplen = static_cast<u16>(8 + len);
         const u16 total  = static_cast<u16>(20 + udplen);
         buf[0] = TypeIpv4;
@@ -601,7 +642,7 @@ namespace ams::mitm::ldn::relay {
         if (m_fd < 0 || size > MaxWrapPayload) {
             return -1;
         }
-        return this->SendWrapped(m_vsrc, 0x0A0DFFFFu, 11452, 11452, 0x4243, lan_packet, size);
+        return this->SendWrapped(m_vsrc, 0x0A0DFFFFu, 11452, 11452, IpIdControl, lan_packet, size);
     }
 
     int RelayTransport::SendGameBroadcast(const void *payload, size_t len, u16 dport) {
@@ -612,8 +653,61 @@ namespace ams::mitm::ldn::relay {
         if (m_fd < 0 || m_rsrc == 0 || len == 0 || len > MaxWrapPayload) {
             return -1;
         }
-        /* sport = dport: SendTo does not expose the source port. */
-        return this->SendWrapped(m_rsrc, dst_ip, dport, dport, 0x474D, payload, len);
+        /* Route by virtual address (LAN IPs collide across NATs); real IPs ride
+           in the shim. sport = dport: the true sport is not visible here. */
+        const bool bcast = (dst_ip == 0xFFFFFFFFu);
+        const u32 vdst = bcast ? 0xFFFFFFFFu : this->LookupVsrc(dst_ip);
+        if (vdst != 0) {
+            u8 shimmed[GameShimLen + MaxWrapPayload];
+            shimmed[0] = (m_rsrc >> 24) & 0xff; shimmed[1] = (m_rsrc >> 16) & 0xff;
+            shimmed[2] = (m_rsrc >> 8) & 0xff;  shimmed[3] = m_rsrc & 0xff;
+            shimmed[4] = (dst_ip >> 24) & 0xff; shimmed[5] = (dst_ip >> 16) & 0xff;
+            shimmed[6] = (dst_ip >> 8) & 0xff;  shimmed[7] = dst_ip & 0xff;
+            std::memcpy(shimmed + GameShimLen, payload, len);
+            return this->SendWrapped(m_vsrc, vdst, dport, dport, IpIdGameV2, shimmed, GameShimLen + len);
+        }
+        return this->SendWrapped(m_rsrc, dst_ip, dport, dport, IpIdGame, payload, len);
+    }
+
+    void RelayTransport::LearnPeer(u32 real_ip, u32 vsrc) {
+        /* Only 10.13/16 sources are relay clients. */
+        if (real_ip == 0 || real_ip == m_rsrc || vsrc == 0 || vsrc == m_vsrc ||
+            (vsrc & 0xFFFF0000u) != 0x0A0D0000u) {
+            return;
+        }
+        std::scoped_lock lk(m_peer_mutex);
+        for (auto &p : m_peers) {
+            if (p.real == real_ip) {
+                if (p.vsrc != vsrc) {
+                    LogFormat("relay: peer %08x vsrc %08x -> %08x", real_ip, p.vsrc, vsrc);
+                    p.vsrc = vsrc;
+                }
+                return;
+            }
+        }
+        LogFormat("relay: peer %08x at vsrc %08x", real_ip, vsrc);
+        m_peers[m_peer_next] = { real_ip, vsrc };
+        m_peer_next = (m_peer_next + 1) % PeerMapMax;
+    }
+
+    u32 RelayTransport::LookupVsrc(u32 real_ip) const {
+        std::scoped_lock lk(m_peer_mutex);
+        for (const auto &p : m_peers) {
+            if (p.real == real_ip) {
+                return p.vsrc;
+            }
+        }
+        return 0;
+    }
+
+    int RelayTransport::SendScope(u32 token) {
+        if (m_fd < 0) {
+            return -1;
+        }
+        const u8 p[5] = { TypeScope,
+            static_cast<u8>((token >> 24) & 0xff), static_cast<u8>((token >> 16) & 0xff),
+            static_cast<u8>((token >> 8) & 0xff),  static_cast<u8>(token & 0xff) };
+        return send(m_fd, p, sizeof(p), 0);
     }
 
     void RelayTransport::InjectGameFrame(const u8 *ip, size_t iplen) {
@@ -627,16 +721,26 @@ namespace ams::mitm::ldn::relay {
         const u8 *udp = ip + ihl;
         const u16 sport = (udp[0] << 8) | udp[1];
         const u16 dport = (udp[2] << 8) | udp[3];
+        const u16 ip_id = (static_cast<u16>(ip[4]) << 8) | ip[5];
         const u8 *payload = udp + 8;
-        const size_t plen = (ip + iplen) - payload;
-        if (plen == 0 || plen > MaxWrapPayload) {
-            return;
-        }
-        const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
+        size_t plen = (ip + iplen) - payload;
+        u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
 
         static std::atomic<u32> s_inject{0};
         const u32 in = s_inject.fetch_add(1, std::memory_order_relaxed) + 1;
         const bool diag = (in <= 8 || (in % 256) == 0);
+
+        if (ip_id == IpIdGameV2) {
+            if (plen <= GameShimLen || src == m_vsrc) {
+                return;
+            }
+            src = (static_cast<u32>(payload[0]) << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
+            payload += GameShimLen;
+            plen -= GameShimLen;
+        }
+        if (plen == 0 || plen > MaxWrapPayload) {
+            return;
+        }
 
         if (src == m_rsrc) {
             if (diag) { LogFormat("diag inject #%u DROP own-echo src %08x", in, src); }
@@ -648,9 +752,22 @@ namespace ams::mitm::ldn::relay {
             if (diag) { LogFormat("diag inject #%u DROP session-inactive src %08x dport %u", in, src, dport); }
             return;
         }
+        bool from_peer = false;
+        for (int i = 0; i < snap.peer_count && !from_peer; i++) {
+            from_peer = (snap.peer_ips[i] == src);
+        }
+        if (!from_peer) {
+            static std::atomic<u32> s_notpeer{0};
+            const u32 nd = s_notpeer.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (diag || (nd & (nd - 1)) == 0) {
+                LogFormat("diag inject #%u DROP not-peer src %08x dport %u (total %u)", in, src, dport, nd);
+            }
+            return;
+        }
 
         if (diag) {
-            LogFormat("diag inject #%u PUSH src %08x sport %u dport %u len %zu", in, src, sport, dport, plen);
+            LogFormat("diag inject #%u PUSH src %08x sport %u dport %u len %zu%s",
+                in, src, sport, dport, plen, ip_id == IpIdGameV2 ? " (v2)" : "");
         }
         /* The local stack cannot deliver a foreign source IP; bsd:u RecvFrom
            serves it from GameRx instead. */
@@ -759,10 +876,27 @@ namespace ams::mitm::ldn::relay {
         const u16 dport = (udp[2] << 8) | udp[3];
         if (dport == tcprelay::TcpTunnelPort) {
             const u8 *tp = udp + 8;
-            const size_t tlen = static_cast<size_t>((ip + iplen) - tp);
-            const u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
+            size_t tlen = static_cast<size_t>((ip + iplen) - tp);
+            const u16 ip_id = (static_cast<u16>(ip[4]) << 8) | ip[5];
+            u32 src = (ip[12] << 24) | (ip[13] << 16) | (ip[14] << 8) | ip[15];
+            if (ip_id == IpIdGameV2) {
+                if (tlen <= GameShimLen || src == m_vsrc) {
+                    return 0;
+                }
+                src = (static_cast<u32>(tp[0]) << 24) | (tp[1] << 16) | (tp[2] << 8) | tp[3];
+                tp += GameShimLen;
+                tlen -= GameShimLen;
+            }
             if (tlen > 0 && src != m_rsrc) {
-                tcprelay::OnTunnelFrame(src, tp, tlen);
+                SessionRegistry::Snapshot snap;
+                SessionRegistry::Get(&snap);
+                bool from_peer = false;
+                for (int i = 0; snap.active && i < snap.peer_count && !from_peer; i++) {
+                    from_peer = (snap.peer_ips[i] == src);
+                }
+                if (from_peer) {
+                    tcprelay::OnTunnelFrame(src, tp, tlen);
+                }
             }
             return 0;
         }

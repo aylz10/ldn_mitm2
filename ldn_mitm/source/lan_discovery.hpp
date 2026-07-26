@@ -4,6 +4,7 @@
 #include <memory>
 #include <thread>
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <stdint.h>
@@ -32,7 +33,7 @@ namespace ams::mitm::ldn {
 
     class LANDiscovery;
 
-    /* RelayHeartbeat payload; ipv4 is the sender, host order. */
+    /* RelayHeartbeat/RelayBye payload; ipv4 is the sender, host order. */
     struct RelayHeartbeatPayload {
         MacAddress bssid;
         u8 _pad[2];
@@ -119,6 +120,7 @@ namespace ams::mitm::ldn {
     class LDTcpSocket : public TcpLanSocketBase, public Pollable {
         protected:
             LANDiscovery *discovery;
+            bool hostClosed = false;
         public:
             LDTcpSocket(int fd, LANDiscovery *discovery) : TcpLanSocketBase(fd), discovery(discovery) {};
             int getFd() override {
@@ -132,6 +134,7 @@ namespace ams::mitm::ldn {
         protected:
             relay::RelayTransport transport;
             LANDiscovery *discovery;
+            u32 lastSrc = 0;
             virtual u32 getBroadcast() override { return 0x0A0DFFFFu; } /* 10.13.255.255 */
             virtual ssize_t recvfrom(void *buf, size_t len, struct sockaddr_in *addr) override;
             virtual int sendto(const void *buf, size_t len, struct sockaddr_in *addr) override;
@@ -143,6 +146,7 @@ namespace ams::mitm::ldn {
             void onClose() override;
             void keepalive() { this->transport.SendKeepalive(); }
             void ping() { this->transport.SendPing(); }
+            void sendScope(u32 token) { this->transport.SendScope(token); }
             bool pathDead() const { return this->transport.PathDead(); }
             Result reopen() {
                 this->transport.Close();
@@ -185,7 +189,7 @@ namespace ams::mitm::ldn {
             static void Worker(void* args);
             NifmRequest request;
             int originalMtu;
-            bool stop;
+            std::atomic_bool stop;
             bool initialized;
             NetworkInfo networkInfo;
             /* Guarded by dataMutex (through lastRelayAdvertise). */
@@ -213,7 +217,9 @@ namespace ams::mitm::ldn {
             void onSyncNetwork(NetworkInfo *info, u16 relaySeq = 0);
             void onConnect(int new_fd);
             void onRelayConnect(const NodeInfo *info);
-            void onDisconnectFromHost();
+            void sendRelayBye();
+            void sendRelayScope();
+            void onDisconnectFromHost(DisconnectReason reason);
             void onNetworkInfoChanged();
 
             void updateNodes();

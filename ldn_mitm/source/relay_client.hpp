@@ -71,6 +71,9 @@ namespace ams::mitm::ldn {
 
                 int SendGameBroadcast(const void *payload, size_t len, u16 dport);
                 int SendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip);
+                /* Thread-safe. */
+                void LearnPeer(u32 real_ip, u32 vsrc);
+                int SendScope(u32 token);
 
             private:
                 int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
@@ -93,6 +96,13 @@ namespace ams::mitm::ldn {
                 u16 m_frag_send_id = 0;
                 u32 m_vsrc = 0;
                 u32 m_rsrc = 0;
+
+                static constexpr int PeerMapMax = 16;
+                struct PeerAddr { u32 real; u32 vsrc; };
+                mutable os::SdkMutex m_peer_mutex;
+                PeerAddr m_peers[PeerMapMax] = {};
+                int m_peer_next = 0;
+                u32 LookupVsrc(u32 real_ip) const;
 
                 static constexpr u32 PingMaxMisses = 4;
                 u32 m_ping_misses = 0;
