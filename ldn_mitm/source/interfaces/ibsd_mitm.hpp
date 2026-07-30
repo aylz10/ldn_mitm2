@@ -44,6 +44,8 @@ namespace ams::mitm::ldn {
     AMS_SF_METHOD_INFO(C, H, 25, Result, Read,   (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, s32 sockfd, ams::sf::OutAutoSelectBuffer message), (ret, bsd_errno, sockfd, message)) \
     AMS_SF_METHOD_INFO(C, H, 6,  Result, Poll,   (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, u32 nfds, s32 timeout, ams::sf::InAutoSelectBuffer fds_in, ams::sf::OutAutoSelectBuffer fds_out), (ret, bsd_errno, nfds, timeout, fds_in, fds_out)) \
     AMS_SF_METHOD_INFO(C, H, 9,  Result, RecvFrom, (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, ams::sf::Out<u32> addrlen, s32 sockfd, u32 flags, ams::sf::OutAutoSelectBuffer message, ams::sf::OutAutoSelectBuffer src_addr), (ret, bsd_errno, addrlen, sockfd, flags, message, src_addr)) \
-    AMS_SF_METHOD_INFO(C, H, 11, Result, SendTo, (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, ams::sf::InAutoSelectBuffer message, ams::sf::InAutoSelectBuffer dst_addr), (ret, bsd_errno, sockfd, flags, message, dst_addr))
+    AMS_SF_METHOD_INFO(C, H, 11, Result, SendTo, (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, ams::sf::InAutoSelectBuffer message, ams::sf::InAutoSelectBuffer dst_addr), (ret, bsd_errno, sockfd, flags, message, dst_addr)) \
+    AMS_SF_METHOD_INFO(C, H, 10, Result, Send,   (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, ams::sf::InAutoSelectBuffer message), (ret, bsd_errno, sockfd, flags, message)) \
+    AMS_SF_METHOD_INFO(C, H, 24, Result, Write,  (ams::sf::Out<s32> ret, ams::sf::Out<s32> bsd_errno, s32 sockfd, ams::sf::InAutoSelectBuffer message), (ret, bsd_errno, sockfd, message))
 
 AMS_SF_DEFINE_MITM_INTERFACE(ams::mitm::ldn, IBsdMitmInterface, AMS_BSD_MITM_INTERFACE, 0x7B5D0C41)

@@ -578,4 +578,46 @@ namespace ams::mitm::ldn {
         R_RETURN(sm::mitm::ResultShouldForwardToSession());
     }
 
+    namespace {
+
+        void LogUnrelayedSend(::Service *fwd, const char *what, s32 sockfd, size_t len,
+                              std::atomic<u32> *counter) {
+            if (!relay::IsEnabled() && !LdnConfig::getBroadcastRelay()) {
+                return;
+            }
+            const u32 n = counter->fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!ShouldLogCapped(n)) {
+                return;
+            }
+            s32 so_type = 0;
+            const bool got_type = GetForwardSockType(fwd, sockfd, std::addressof(so_type));
+
+            SessionRegistry::Snapshot snap;
+            SessionRegistry::Get(std::addressof(snap));
+
+            LogFormat("diag %s #%u fd %d len %zu type %d active %d peers %d NOT RELAYED",
+                what, n, sockfd, len, got_type ? so_type : -1,
+                static_cast<int>(snap.active), snap.peer_count);
+        }
+
+    }
+
+    Result BsdMitmService::Send(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, s32 flags, sf::InAutoSelectBuffer message) {
+        AMS_UNUSED(ret, bsd_errno, flags);
+
+        static std::atomic<u32> s_send{0};
+        LogUnrelayedSend(this->m_forward_service.get(), "Send", sockfd, message.GetSize(), std::addressof(s_send));
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
+    Result BsdMitmService::Write(sf::Out<s32> ret, sf::Out<s32> bsd_errno, s32 sockfd, sf::InAutoSelectBuffer message) {
+        AMS_UNUSED(ret, bsd_errno);
+
+        static std::atomic<u32> s_write{0};
+        LogUnrelayedSend(this->m_forward_service.get(), "Write", sockfd, message.GetSize(), std::addressof(s_write));
+
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
 }

@@ -63,6 +63,8 @@ namespace ams {
             .sb_efficiency = 4,
 
             .num_bsd_sessions = 3,
+            /* bsd:u, not Auto: Auto takes bsd:s, whose small system-wide
+               session budget a boot sysmodule must not drain. */
             .bsd_service_type = BsdServiceType_User,
         };
 
@@ -254,6 +256,8 @@ namespace ams {
         R_ABORT_UNLESS(log::Initialize());
         LogFormat("main");
 
+        mitm::ldn::relay::LoadConfig();
+
         constexpr sm::ServiceName LdnMitmServiceName = sm::ServiceName::Encode("ldn:u");
         R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::LdnMitMService>(mitm::PortIndex_Ldn, LdnMitmServiceName)));
 
@@ -261,7 +265,8 @@ namespace ams {
         R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::BsdMitmService>(mitm::PortIndex_Bsd, BsdMitmServiceName)));
         LogFormat("registered");
 
-        mitm::ldn::relay::LoadConfig();
+        /* No psc PmModule (it asserts omm across suspend); sleep shows up as
+           POLLHUP in LDUdpSocket::onClose. */
 
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,
