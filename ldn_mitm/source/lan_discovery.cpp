@@ -133,7 +133,7 @@ namespace ams::mitm::ldn {
     }
 
     int RelayLanSocket::onRead() {
-        this->recvPacket([&](LANPacketType type, const void *data, size_t size, ReplyFunc reply) -> int {
+        const MessageCallback dispatch = [&](LANPacketType type, const void *data, size_t size, ReplyFunc reply) -> int {
             AMS_UNUSED(reply);
             switch (type) {
                 case LANPacketType::Scan: {
@@ -262,7 +262,15 @@ namespace ams::mitm::ldn {
                     break;
             }
             return 0;
-        });
+        };
+
+        /* recvPacket returns 0 for consumed-but-unused frames, <0 only when dry. */
+        constexpr int MaxFramesPerWakeup = 64;
+        for (int drained = 0; drained < MaxFramesPerWakeup; drained++) {
+            if (this->recvPacket(dispatch) < 0) {
+                break;
+            }
+        }
         return 0;
     }
 

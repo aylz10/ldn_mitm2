@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <atomic>
 #include <cstring>
 
@@ -34,6 +35,9 @@ namespace ams::mitm::ldn {
            client cannot pin a real bsd:u request. */
         constexpr s32 WaitCapMs    = 1000;
         constexpr s32 ForwardMaxMs = 60000;
+        /* While relay frames are queued, so a game not polling its session fd
+           returns promptly to collect them. */
+        constexpr s32 QueuedWaitCapMs = 2;
 
         struct BsdOutData {
             s32 ret;
@@ -58,6 +62,14 @@ namespace ams::mitm::ldn {
             }
             *out_port = ntohs(sa.sin_port);
             return true;
+        }
+
+        /* fcntl F_GETFL, bsd cmd 20. */
+        bool ForwardSocketNonBlocking(::Service *fwd, s32 sockfd) {
+            const struct { s32 sockfd; s32 cmd; s32 flags; } in = { sockfd, F_GETFL, 0 };
+            struct { s32 ret; s32 bsd_errno; } out = {};
+            const Result rc = serviceDispatchInOut(fwd, 20, in, out);
+            return R_SUCCEEDED(rc) && out.ret >= 0 && (out.ret & O_NONBLOCK) != 0;
         }
 
         /* getsockopt, bsd cmd 17. */
@@ -139,7 +151,8 @@ namespace ams::mitm::ldn {
             if (!IsGameRecvSocket(fwd, sockfd)) {
                 return false;
             }
-            if (dontwait ? !GameRx::HasData() : !WaitForGameRx(fwd, sockfd)) {
+            if (!GameRx::HasData() &&
+                (dontwait || ForwardSocketNonBlocking(fwd, sockfd) || !WaitForGameRx(fwd, sockfd))) {
                 return false;
             }
 
@@ -245,8 +258,9 @@ namespace ams::mitm::ldn {
         s64 remaining = finite ? (static_cast<s64>(in_data.tv_sec) * 1000 + in_data.tv_usec / 1000) : 0;
         ::Service *fwd = this->m_forward_service.get();
         for (;;) {
-            s64 slice = WaitCapMs;
-            if (finite && remaining < WaitCapMs) {
+            const bool queued = relay::IsEnabled() && GameRx::HasData();
+            s64 slice = queued ? QueuedWaitCapMs : WaitCapMs;
+            if (finite && remaining < slice) {
                 slice = remaining;
             }
             BsdSelectInData in = in_data;
@@ -305,11 +319,25 @@ namespace ams::mitm::ldn {
         if (relay::IsEnabled() && GameRx::HasData()) {
             const s32 gfd = GameRx::GameFd();
             const size_t need = static_cast<size_t>(nfds) * sizeof(struct pollfd);
+
+            static std::atomic<u32> s_wake{0};
+            const u32 wn = s_wake.fetch_add(1, std::memory_order_relaxed) + 1;
+            const bool wake_log = ShouldLogCapped(wn);
+            if (wake_log && (gfd < 0 || fds_in.GetSize() < need || fds_out.GetSize() < need)) {
+                LogFormat("diag Poll WAKE #%u SKIP gamefd %d nfds %u in %zu out %zu need %zu",
+                    wn, gfd, nfds, fds_in.GetSize(), fds_out.GetSize(), need);
+            }
+
             if (gfd >= 0 && fds_in.GetSize() >= need && fds_out.GetSize() >= need) {
                 const auto *pin = reinterpret_cast<const struct pollfd *>(fds_in.GetPointer());
                 bool present = false;
                 for (u32 i = 0; i < nfds; i++) {
                     if (pin[i].fd == gfd) { present = true; break; }
+                }
+                if (wake_log) {
+                    LogFormat("diag Poll WAKE #%u gamefd %d nfds %u present %d timeout %d polled %d",
+                        wn, gfd, nfds, static_cast<int>(present), timeout,
+                        (nfds > 0) ? pin[0].fd : -1);
                 }
                 if (present) {
                     const struct { u32 nfds; s32 timeout; } in = { nfds, 0 };
@@ -360,8 +388,9 @@ namespace ams::mitm::ldn {
         s64 remaining = timeout;
         ::Service *fwd = this->m_forward_service.get();
         for (;;) {
-            s32 slice = WaitCapMs;
-            if (finite && remaining < WaitCapMs) {
+            const bool queued = relay::IsEnabled() && GameRx::HasData();
+            s32 slice = queued ? QueuedWaitCapMs : WaitCapMs;
+            if (finite && remaining < slice) {
                 slice = static_cast<s32>(remaining);
             }
             const struct {
@@ -412,8 +441,10 @@ namespace ams::mitm::ldn {
             (flags & MSG_PEEK) == 0 &&
             src_addr.GetSize() >= sizeof(struct sockaddr_in) &&
             IsGameRecvSocket(this->m_forward_service.get(), sockfd) &&
-            ((flags & MSG_DONTWAIT) != 0 ? GameRx::HasData()
-                                         : WaitForGameRx(this->m_forward_service.get(), sockfd))) {
+            (GameRx::HasData() ||
+             ((flags & MSG_DONTWAIT) == 0 &&
+              !ForwardSocketNonBlocking(this->m_forward_service.get(), sockfd) &&
+              WaitForGameRx(this->m_forward_service.get(), sockfd)))) {
 
             u32 src_ip = 0; u16 sport = 0; size_t out_len = 0;
             if (GameRx::Pop(&src_ip, &sport, message.GetPointer(), message.GetSize(), &out_len)) {
