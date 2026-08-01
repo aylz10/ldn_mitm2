@@ -3,6 +3,12 @@
 #include <arpa/inet.h>
 
 namespace ams::mitm::ldn {
+    /* Highest emulated ldn protocol: 0/1 = NX, 3 = lp2p. */
+    constexpr u32 ProtocolNx = 1;
+
+    /* nn::ldn module; description is a guess. */
+    static const Result ResultProtocolUnsupported = MAKERESULT(0xCB, 16);
+
     static_assert(sizeof(NetworkInfo) == 0x480, "sizeof(NetworkInfo) should be 0x480");
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
     static_assert(sizeof(ScanFilter) == 0x60, "sizeof(ScanFilter) should be 0x60");
@@ -247,6 +253,11 @@ namespace ams::mitm::ldn {
 
     Result ICommunicationService::SetProtocol(u32 protocol) {
         LogFormat("SetProtocol %u", protocol);
+
+        if (protocol > ProtocolNx) {
+            LogFormat("SetProtocol: refusing %u, only the NX protocol is emulated", protocol);
+            return ResultProtocolUnsupported;
+        }
         return 0;
     }
 
