@@ -64,18 +64,24 @@ namespace ams::mitm::ldn {
         GameRxEntry g_rx_ring[GameRx::MaxEntries];
         int g_rx_head = 0;
         int g_rx_count = 0;
-        s32 g_game_fd = -1;
         u16 g_session_dport = 0;
+        u32 g_overflow_dropped = 0;
+        u32 g_stale_dropped = 0;
     }
 
-    void GameRx::SetGameFd(s32 fd) {
+    int GameRx::Depth() {
         std::scoped_lock lk(g_rx_mutex);
-        g_game_fd = fd;
+        return g_rx_count;
     }
 
-    s32 GameRx::GameFd() {
+    u32 GameRx::OverflowDropped() {
         std::scoped_lock lk(g_rx_mutex);
-        return g_game_fd;
+        return g_overflow_dropped;
+    }
+
+    u32 GameRx::StaleDropped() {
+        std::scoped_lock lk(g_rx_mutex);
+        return g_stale_dropped;
     }
 
     void GameRx::Push(u32 src_ip, u16 sport, u16 dport, const void *data, size_t len) {
@@ -83,11 +89,12 @@ namespace ams::mitm::ldn {
             return;
         }
         std::scoped_lock lk(g_rx_mutex);
-        /* Enqueue even before the game fd is known. */
+        /* Enqueue even before the session port is known. */
         int slot;
         if (g_rx_count == MaxEntries) {
             slot = g_rx_head;
             g_rx_head = (g_rx_head + 1) % MaxEntries;
+            g_overflow_dropped++;
         } else {
             slot = (g_rx_head + g_rx_count) % MaxEntries;
             g_rx_count++;
@@ -105,6 +112,12 @@ namespace ams::mitm::ldn {
         std::scoped_lock lk(g_rx_mutex);
         if (g_rx_count == 0) {
             return false;
+        }
+        if (DropStale && g_rx_count > FreshDepth) {
+            const int skip = g_rx_count - FreshDepth;
+            g_rx_head = (g_rx_head + skip) % MaxEntries;
+            g_rx_count -= skip;
+            g_stale_dropped += static_cast<u32>(skip);
         }
         const GameRxEntry &e = g_rx_ring[g_rx_head];
         const size_t n = e.len < max_len ? e.len : max_len;
@@ -127,7 +140,9 @@ namespace ams::mitm::ldn {
             return;
         }
         std::scoped_lock lk(g_rx_mutex);
-        g_session_dport = port;
+        if (g_session_dport == 0) {
+            g_session_dport = port;
+        }
     }
 
     u16 GameRx::SessionDport() {
@@ -135,20 +150,13 @@ namespace ams::mitm::ldn {
         return g_session_dport;
     }
 
-    u16 GameRx::PeekDport() {
-        std::scoped_lock lk(g_rx_mutex);
-        if (g_rx_count == 0) {
-            return 0;
-        }
-        return g_rx_ring[g_rx_head].dport;
-    }
-
     void GameRx::Clear() {
         std::scoped_lock lk(g_rx_mutex);
         g_rx_count = 0;
         g_rx_head = 0;
-        g_game_fd = -1;
         g_session_dport = 0;
+        g_overflow_dropped = 0;
+        g_stale_dropped = 0;
     }
 
 }
