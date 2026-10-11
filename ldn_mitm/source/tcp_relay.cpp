@@ -1,7 +1,5 @@
 #include "tcp_relay.hpp"
 #include "relay_client.hpp"
-#include "session_registry.hpp"
-#include "nifm_manager.hpp"
 #include "debug.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -9,6 +7,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <mutex>
@@ -42,25 +41,28 @@ namespace ams::mitm::ldn::tcprelay {
         static_assert(sizeof(TunnelHeader) == 8);
 
         struct Stream {
-            bool  used;
-            bool  originator;   /* we redirected the game's connect */
-            u16   id;
-            u32   peer_ip;
-            s32   game_fd;
-            u16   local_port;
-            int   listener;
-            int   sock;
-            u8    pending[PendingMax];
-            size_t pending_len;
+            bool   used        = false;
+            bool   originator  = false;   /* we redirected the game's connect */
+            u16    id          = 0;
+            u32    peer_ip     = 0;
+            s32    game_fd     = -1;
+            u16    local_port  = 0;
+            int    listener    = -1;
+            int    sock        = -1;
+            size_t pending_len = 0;
+            u8     pending[PendingMax];
         };
 
+        /* Lock order: g_lifecycle_mutex -> g_mutex -> relay bridge. */
+        os::SdkMutex g_lifecycle_mutex;
         os::SdkMutex g_mutex;
         Stream g_streams[MaxStreams];
         u16 g_next_id = 1;
+        int g_refs = 0;   /* under g_mutex */
 
         os::ThreadType g_thread;
         alignas(os::ThreadStackAlignment) u8 g_stack[0x4000];
-        bool g_running = false;
+        std::atomic<bool> g_running{false};
 
         void SetNonBlocking(int fd) {
             const int flags = fcntl(fd, F_GETFL, 0);
@@ -97,11 +99,7 @@ namespace ams::mitm::ldn::tcprelay {
         Stream *Alloc() {
             for (auto &s : g_streams) {
                 if (!s.used) {
-                    s = {};
-                    s.used     = true;
-                    s.listener = -1;
-                    s.sock     = -1;
-                    s.game_fd  = -1;
+                    s.used = true;
                     return std::addressof(s);
                 }
             }
@@ -112,10 +110,12 @@ namespace ams::mitm::ldn::tcprelay {
         void Release(Stream *s) {
             if (s->listener >= 0) { ::close(s->listener); }
             if (s->sock >= 0)     { ::close(s->sock); }
-            *s = {};
-            s->listener = -1;
-            s->sock     = -1;
-            s->game_fd  = -1;
+            s->used        = false;
+            s->originator  = false;
+            s->listener    = -1;
+            s->sock        = -1;
+            s->game_fd     = -1;
+            s->pending_len = 0;
         }
 
         int SendTunnel(u32 peer_ip, u8 type, u16 id, u16 port, const void *data, size_t len, u8 owner) {
@@ -135,21 +135,15 @@ namespace ams::mitm::ldn::tcprelay {
             return relay::BridgeSendGameUnicast(buf, sizeof(TunnelHeader) + len, TcpTunnelPort, peer_ip);
         }
 
-        u32 GetSelfIp() {
-            ScopedNifmSession session;
-            if (R_FAILED(session.GetResult())) {
-                return 0;
-            }
-            u32 ip = 0;
-            if (R_FAILED(nifmGetCurrentIpAddress(std::addressof(ip)))) {
-                return 0;
-            }
-            return ntohl(ip);
+        /* Requires g_mutex. */
+        void CloseStream(Stream *s) {
+            SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
+            Release(s);
         }
 
         /* Real address first: 127.0.0.1 is refused for game listeners. */
         int ConnectLocal(u16 port) {
-            const u32 targets[2] = { GetSelfIp(), LoopbackIp };
+            const u32 targets[2] = { relay::BridgeSelfIp(), LoopbackIp };
             for (u32 ip : targets) {
                 if (ip == 0) {
                     continue;
@@ -182,13 +176,33 @@ namespace ams::mitm::ldn::tcprelay {
                         return;
                     }
                     LogFormat("tcprelay: stream %u local send failed errno %d", s->id, errno);
-                    SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
-                    Release(s);
+                    CloseStream(s);
                     return;
                 }
                 std::memmove(s->pending, s->pending + n, s->pending_len - n);
                 s->pending_len -= static_cast<size_t>(n);
             }
+        }
+
+        /* bsd Connect is cmd 14: in { s32 sockfd }, AutoSelect-In sockaddr,
+           out { s32 ret; s32 errno }. */
+        Result DispatchConnect(::Service *fwd, s32 sockfd, u16 port, s32 *out_ret, s32 *out_bsd_errno) {
+            struct sockaddr_in target = {};
+            target.sin_family      = AF_INET;
+            target.sin_port        = htons(port);
+            target.sin_addr.s_addr = htonl(LoopbackIp);
+
+            const struct { s32 sockfd; } in = { sockfd };
+            struct { s32 ret; s32 bsd_errno; } out = {};
+            const Result rc = serviceDispatchInOut(fwd, 14, in, out,
+                .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In },
+                .buffers = { { std::addressof(target), sizeof(target) } },
+            );
+            if (R_SUCCEEDED(rc)) {
+                *out_ret       = out.ret;
+                *out_bsd_errno = out.bsd_errno;
+            }
+            return rc;
         }
 
         void PumpThread(void *) {
@@ -211,7 +225,8 @@ namespace ams::mitm::ldn::tcprelay {
                             n++;
                         }
                         if (s.sock >= 0) {
-                            pfds[n] = { .fd = s.sock, .events = POLLIN, .revents = 0 };
+                            const short events = POLLIN | (s.pending_len > 0 ? POLLOUT : 0);
+                            pfds[n] = { .fd = s.sock, .events = events, .revents = 0 };
                             owners[n] = std::addressof(s);
                             is_listener[n] = false;
                             n++;
@@ -225,11 +240,11 @@ namespace ams::mitm::ldn::tcprelay {
                 }
 
                 const int rc = ::poll(pfds, n, 20);
-                if (rc <= 0) {
-                    std::scoped_lock lk(g_mutex);
-                    for (auto &s : g_streams) {
-                        if (s.used) { FlushPending(std::addressof(s)); }
-                    }
+                if (rc < 0) {
+                    svcSleepThread(20000000L);
+                    continue;
+                }
+                if (rc == 0) {
                     continue;
                 }
 
@@ -239,16 +254,16 @@ namespace ams::mitm::ldn::tcprelay {
                     }
                     std::scoped_lock lk(g_mutex);
                     Stream *s = owners[i];
-                    if (!s->used) {
-                        continue;
-                    }
                     /* poll() ran unlocked: act only if the slot still owns this fd. */
-                    if (is_listener[i] ? (s->listener != pfds[i].fd) : (s->sock != pfds[i].fd)) {
+                    if (!s->used || (is_listener[i] ? (s->listener != pfds[i].fd) : (s->sock != pfds[i].fd))) {
                         continue;
                     }
 
                     if (is_listener[i]) {
-                        if (pfds[i].revents & POLLIN) {
+                        if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                            LogFormat("tcprelay: stream %u listener failed", s->id);
+                            CloseStream(s);
+                        } else if (pfds[i].revents & POLLIN) {
                             const int fd = ::accept(s->listener, nullptr, nullptr);
                             if (fd >= 0) {
                                 SetNonBlocking(fd);
@@ -264,24 +279,31 @@ namespace ams::mitm::ldn::tcprelay {
 
                     if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                         LogFormat("tcprelay: stream %u local socket closed", s->id);
-                        SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
-                        Release(s);
+                        CloseStream(s);
                         continue;
+                    }
+
+                    if (pfds[i].revents & POLLOUT) {
+                        FlushPending(s);
+                        if (!s->used || s->sock != pfds[i].fd) {
+                            continue;
+                        }
                     }
 
                     if (pfds[i].revents & POLLIN) {
                         u8 buf[MaxChunk];
                         const ssize_t got = ::recv(s->sock, buf, sizeof(buf), 0);
                         if (got > 0) {
-                            SendTunnel(s->peer_ip, TunnelData, s->id, 0, buf, static_cast<size_t>(got), OwnerOf(s));
+                            if (SendTunnel(s->peer_ip, TunnelData, s->id, 0, buf, static_cast<size_t>(got), OwnerOf(s)) < 0) {
+                                LogFormat("tcprelay: stream %u tunnel send failed", s->id);
+                                CloseStream(s);
+                            }
                         } else if (got == 0) {
                             LogFormat("tcprelay: stream %u closed by game", s->id);
-                            SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
-                            Release(s);
+                            CloseStream(s);
                         } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                             LogFormat("tcprelay: stream %u recv errno %d", s->id, errno);
-                            SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
-                            Release(s);
+                            CloseStream(s);
                         }
                     }
                 }
@@ -292,45 +314,19 @@ namespace ams::mitm::ldn::tcprelay {
 
     bool RedirectConnect(::Service *fwd, s32 sockfd, u32 dst_ip, u16 dst_port,
                          s32 *out_ret, s32 *out_bsd_errno) {
-        if (!relay::IsEnabled()) {
-            return false;
-        }
-
-        SessionRegistry::Snapshot snap;
-        SessionRegistry::Get(std::addressof(snap));
-        bool is_peer = false;
-        for (int i = 0; i < snap.peer_count; i++) {
-            if (snap.active && dst_ip == snap.peer_ips[i]) {
-                is_peer = true;
-                break;
-            }
-        }
-        if (!is_peer) {
+        if (!relay::IsEnabled() || !relay::IsSessionPeer(dst_ip)) {
             return false;
         }
 
         std::scoped_lock lk(g_mutex);
+        if (!g_running) {
+            return false;
+        }
 
         /* Repeat connect on the same socket is the game polling a
            non-blocking connect; re-point it at the existing proxy. */
         if (Stream *existing = FindByGameFd(sockfd); existing != nullptr) {
-            struct sockaddr_in again = {};
-            again.sin_family      = AF_INET;
-            again.sin_port        = htons(existing->local_port);
-            again.sin_addr.s_addr = htonl(LoopbackIp);
-
-            const struct { s32 sockfd; } in_again = { sockfd };
-            struct { s32 ret; s32 bsd_errno; } out_again = {};
-            const Result rc_again = serviceDispatchInOut(fwd, 14, in_again, out_again,
-                .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In },
-                .buffers = { { std::addressof(again), sizeof(again) } },
-            );
-            if (R_FAILED(rc_again)) {
-                return false;
-            }
-            *out_ret       = out_again.ret;
-            *out_bsd_errno = out_again.bsd_errno;
-            return true;
+            return R_SUCCEEDED(DispatchConnect(fwd, sockfd, existing->local_port, out_ret, out_bsd_errno));
         }
 
         Stream *s = Alloc();
@@ -371,19 +367,8 @@ namespace ams::mitm::ldn::tcprelay {
         s->game_fd    = sockfd;
         s->local_port = local_port;
 
-        /* bsd Connect is cmd 14: in { s32 sockfd }, AutoSelect-In sockaddr,
-           out { s32 ret; s32 errno }. */
-        struct sockaddr_in target = {};
-        target.sin_family      = AF_INET;
-        target.sin_port        = htons(local_port);
-        target.sin_addr.s_addr = htonl(LoopbackIp);
-
-        const struct { s32 sockfd; } in = { sockfd };
-        struct { s32 ret; s32 bsd_errno; } out = {};
-        const Result rc = serviceDispatchInOut(fwd, 14, in, out,
-            .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In },
-            .buffers = { { std::addressof(target), sizeof(target) } },
-        );
+        s32 ret = 0, bsd_errno = 0;
+        const Result rc = DispatchConnect(fwd, sockfd, local_port, std::addressof(ret), std::addressof(bsd_errno));
         if (R_FAILED(rc)) {
             LogFormat("tcprelay: redirected connect dispatch failed %x", rc);
             Release(s);
@@ -391,12 +376,12 @@ namespace ams::mitm::ldn::tcprelay {
         }
 
         LogFormat("tcprelay: stream %u redirect connect fd %d -> %08x:%u via 127.0.0.1:%u (ret %d errno %d)",
-            s->id, sockfd, dst_ip, dst_port, local_port, out.ret, out.bsd_errno);
+            s->id, sockfd, dst_ip, dst_port, local_port, ret, bsd_errno);
 
         SendTunnel(dst_ip, TunnelOpen, s->id, dst_port, nullptr, 0, OwnerSender);
 
-        *out_ret       = out.ret;
-        *out_bsd_errno = out.bsd_errno;
+        *out_ret       = ret;
+        *out_bsd_errno = bsd_errno;
         return true;
     }
 
@@ -411,6 +396,9 @@ namespace ams::mitm::ldn::tcprelay {
         const size_t data_len = avail < static_cast<size_t>(h.len) ? avail : static_cast<size_t>(h.len);
 
         std::scoped_lock lk(g_mutex);
+        if (!g_running) {
+            return;
+        }
 
         switch (h.type) {
             case TunnelOpen: {
@@ -420,6 +408,7 @@ namespace ams::mitm::ldn::tcprelay {
                 Stream *s = Alloc();
                 if (s == nullptr) {
                     LogFormat("tcprelay: out of streams for incoming open");
+                    SendTunnel(src_ip, TunnelClose, h.stream, 0, nullptr, 0, OwnerReceiver);
                     return;
                 }
                 s->originator = false;
@@ -428,8 +417,7 @@ namespace ams::mitm::ldn::tcprelay {
                 s->sock       = ConnectLocal(h.port);
                 if (s->sock < 0) {
                     LogFormat("tcprelay: stream %u could not reach local game port %u", h.stream, h.port);
-                    SendTunnel(src_ip, TunnelClose, h.stream, 0, nullptr, 0, OwnerReceiver);
-                    Release(s);
+                    CloseStream(s);
                     return;
                 }
                 LogFormat("tcprelay: stream %u opened for peer %08x -> local port %u", h.stream, src_ip, h.port);
@@ -437,14 +425,18 @@ namespace ams::mitm::ldn::tcprelay {
             }
             case TunnelData: {
                 Stream *s = FindById(src_ip, h.stream, h.owner == OwnerReceiver);
-                if (s == nullptr || data_len == 0) {
+                if (s == nullptr) {
+                    const u8 reply_owner = (h.owner == OwnerSender) ? OwnerReceiver : OwnerSender;
+                    SendTunnel(src_ip, TunnelClose, h.stream, 0, nullptr, 0, reply_owner);
+                    return;
+                }
+                if (data_len == 0) {
                     return;
                 }
                 if (s->pending_len + data_len > PendingMax) {
                     /* Dropping bytes would corrupt the stream; close it. */
                     LogFormat("tcprelay: stream %u pending overflow, closing", h.stream);
-                    SendTunnel(s->peer_ip, TunnelClose, s->id, 0, nullptr, 0, OwnerOf(s));
-                    Release(s);
+                    CloseStream(s);
                     return;
                 }
                 std::memcpy(s->pending + s->pending_len, data, data_len);
@@ -466,14 +458,11 @@ namespace ams::mitm::ldn::tcprelay {
     }
 
     void Start() {
+        std::scoped_lock life(g_lifecycle_mutex);
         std::scoped_lock lk(g_mutex);
+        g_refs++;
         if (g_running) {
             return;
-        }
-        for (auto &s : g_streams) {
-            s = {};
-            s.listener = -1;
-            s.sock     = -1;
         }
         g_running = true;
         /* AMS priority (0..31), same as the LANDiscovery worker. */
@@ -489,9 +478,13 @@ namespace ams::mitm::ldn::tcprelay {
     }
 
     void Stop() {
+        std::scoped_lock life(g_lifecycle_mutex);
         {
             std::scoped_lock lk(g_mutex);
-            if (!g_running) {
+            if (g_refs > 0) {
+                g_refs--;
+            }
+            if (g_refs > 0 || !g_running) {
                 return;
             }
             g_running = false;
@@ -501,7 +494,7 @@ namespace ams::mitm::ldn::tcprelay {
         {
             std::scoped_lock lk(g_mutex);
             for (auto &s : g_streams) {
-                if (s.used) { Release(std::addressof(s)); }
+                if (s.used) { CloseStream(std::addressof(s)); }
             }
         }
         LogFormat("tcprelay: stopped");

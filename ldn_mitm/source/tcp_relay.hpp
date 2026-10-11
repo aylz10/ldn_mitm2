@@ -12,6 +12,7 @@ namespace ams::mitm::ldn::tcprelay {
 
     void OnTunnelFrame(u32 src_ip, const u8 *payload, size_t len);
 
+    /* Refcounted: one reference per open relay transport. */
     void Start();
     void Stop();
 

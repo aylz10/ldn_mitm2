@@ -17,6 +17,7 @@
 #pragma once
 #include <switch.h>
 #include <stratosphere.hpp>
+#include <atomic>
 
 namespace ams::mitm::ldn {
 
@@ -42,11 +43,15 @@ namespace ams::mitm::ldn {
         const char *ServerHost();
         u16 ServerPort();
 
+        bool IsSessionPeer(u32 ip);
+
         /* Thread-safe; -1 when no transport is open. Ports and IPs are host order. */
         int BridgeSendGameBroadcast(const void *payload, size_t len, u16 dport);
         int BridgeSendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip);
+        u32 BridgeSelfIp();
 
-        /* Not thread-safe; owned by one LANDiscovery worker. */
+        /* Open/Close/Reopen/RecvBroadcast/PathDead belong to the owning worker;
+           Send*, LearnPeer and RealIp are thread-safe. */
         class RelayTransport {
             public:
                 RelayTransport() = default;
@@ -54,33 +59,41 @@ namespace ams::mitm::ldn {
 
                 Result Open();
                 void Close();
+                /* Replaces the socket without unpublishing, so TCP tunnels survive. */
+                Result Reopen();
                 bool IsOpen() const { return m_fd >= 0; }
                 int GetFd() const { return m_fd; }
+                u32 RealIp() const;
 
                 int SendBroadcast(const void *lan_packet, size_t size);
                 int SendKeepalive();
-
                 int SendPing();
 
                 /* Ping misses count only once the server has echoed a ping. */
                 bool PathDead() const;
 
-                /* Returns a discovery frame's length; game frames are
+                /* Returns a discovery frame's length; game and TCP frames are
                    dispatched internally (returns 0). <0 on error. */
                 int RecvBroadcast(void *out, size_t max_size, u32 *out_src_ip);
 
                 int SendGameBroadcast(const void *payload, size_t len, u16 dport);
                 int SendGameUnicast(const void *payload, size_t len, u16 dport, u32 dst_ip);
-                /* Thread-safe. */
                 void LearnPeer(u32 real_ip, u32 vsrc);
                 int SendScope(u32 token);
 
             private:
-                int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
+                Result OpenSocket();
+                void CloseSocket();
 
+                /* Require m_mutex. */
+                int SendGameUnicastLocked(const void *payload, size_t len, u16 dport, u32 dst_ip);
+                int SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len);
                 int SendFragmented(u32 src, u32 dst, const u8 *packet, size_t total);
 
                 int ProcessIpv4(const u8 *ip, size_t iplen, void *out, size_t max_size, u32 *out_src_ip);
+
+                /* False if the frame is malformed or our own. */
+                bool UnwrapGameShim(const u8 *ip, const u8 **payload, size_t *len, u32 *src) const;
 
                 const u8 *ReassembleFrag(const u8 *p, size_t n, size_t *out_len);
 
@@ -89,13 +102,18 @@ namespace ams::mitm::ldn {
 
                 void InjectGameFrame(const u8 *ip, size_t iplen);
 
+                /* Guards m_fd, m_vsrc, m_rsrc, m_frag_send_id. Lock order:
+                   g_bridge_mutex -> m_mutex -> m_peer_mutex. */
+                mutable os::SdkMutex m_mutex;
                 int m_fd = -1;
-                NifmRequest m_req{};
-                bool m_have_req = false;
-                bool m_have_nifm_session = false;
                 u16 m_frag_send_id = 0;
                 u32 m_vsrc = 0;
                 u32 m_rsrc = 0;
+
+                NifmRequest m_req{};
+                bool m_have_req = false;
+                bool m_have_nifm_session = false;
+                bool m_published = false;
 
                 static constexpr int PeerMapMax = 16;
                 struct PeerAddr { u32 real; u32 vsrc; };
@@ -105,8 +123,8 @@ namespace ams::mitm::ldn {
                 u32 LookupVsrc(u32 real_ip) const;
 
                 static constexpr u32 PingMaxMisses = 4;
-                u32 m_ping_misses = 0;
-                bool m_ping_supported = false;
+                std::atomic<u32> m_ping_misses{0};
+                std::atomic<bool> m_ping_supported{false};
 
                 static constexpr int FragSlots = 4;
                 struct FragSlot {
