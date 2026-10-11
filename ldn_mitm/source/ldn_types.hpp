@@ -12,6 +12,9 @@ namespace ams::mitm::ldn {
     const int StationCountMax = NodeCountMax - 1;
     const size_t  PassphraseLengthMax = 64;
 
+    /* nn::ldn result module. */
+    constexpr int LdnModuleId = 0xCB;
+
     enum NodeStateChange { 
         NodeStateChange_None = 0, 
         NodeStateChange_Connect = 1, 

@@ -7,7 +7,7 @@ namespace ams::mitm::ldn {
     constexpr u32 ProtocolNx = 1;
 
     /* nn::ldn module; description is a guess. */
-    static const Result ResultProtocolUnsupported = MAKERESULT(0xCB, 16);
+    static const Result ResultProtocolUnsupported = MAKERESULT(LdnModuleId, 16);
 
     static_assert(sizeof(NetworkInfo) == 0x480, "sizeof(NetworkInfo) should be 0x480");
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
@@ -115,38 +115,7 @@ namespace ams::mitm::ldn {
     Result ICommunicationService::GetNetworkInfo(sf::Out<NetworkInfo> buffer) {
         LogFormat("get_network_info %p state: %d", buffer.GetPointer(), static_cast<u32>(this->lanDiscovery.getState()));
 
-        Result rc = lanDiscovery.getNetworkInfo(buffer.GetPointer());
-
-        if (R_SUCCEEDED(rc)) {
-            const NetworkInfo *ni = buffer.GetPointer();
-            static u8 s_last_count = 0xff;
-            static u32 s_last_ips[NodeCountMax] = {};
-            bool changed = (ni->ldn.nodeCount != s_last_count);
-            for (int i = 0; i < NodeCountMax; i++) {
-                if (ni->ldn.nodes[i].ipv4Address != s_last_ips[i]) {
-                    changed = true;
-                }
-            }
-            if (changed) {
-                s_last_count = ni->ldn.nodeCount;
-                for (int i = 0; i < NodeCountMax; i++) {
-                    s_last_ips[i] = ni->ldn.nodes[i].ipv4Address;
-                }
-                LogFormat("diag netinfo: nodeCount %d/%d secMode %d bssid %02x%02x%02x%02x%02x%02x",
-                    ni->ldn.nodeCount, ni->ldn.nodeCountMax, ni->ldn.securityMode,
-                    ni->common.bssid.raw[0], ni->common.bssid.raw[1], ni->common.bssid.raw[2],
-                    ni->common.bssid.raw[3], ni->common.bssid.raw[4], ni->common.bssid.raw[5]);
-                for (int i = 0; i < NodeCountMax; i++) {
-                    const NodeInfo &n = ni->ldn.nodes[i];
-                    if (n.isConnected || n.ipv4Address != 0) {
-                        LogFormat("diag netinfo  node[%d] id %d conn %d ip %08x ver %d user '%.10s'",
-                            i, n.nodeId, n.isConnected, n.ipv4Address, n.localCommunicationVersion, n.userName);
-                    }
-                }
-            }
-        }
-
-        return rc;
+        return lanDiscovery.getNetworkInfo(buffer.GetPointer());
     }
 
     Result ICommunicationService::GetDisconnectReason(sf::Out<u32> reason) {
@@ -241,16 +210,6 @@ namespace ams::mitm::ldn {
         return lanDiscovery.connectPrivate(&param.securityParameter, &param.userConfig, param.localCommunicationVersion, &param.networkConfig);
     }
 
-    /*nyi*/
-    Result ICommunicationService::SetStationAcceptPolicy(u8 policy) {
-		AMS_UNUSED(policy);
-        return 0;
-    }
-
-    Result ICommunicationService::SetWirelessControllerRestriction() {
-        return 0;
-    }
-
     Result ICommunicationService::SetProtocol(u32 protocol) {
         LogFormat("SetProtocol %u", protocol);
 
@@ -258,6 +217,16 @@ namespace ams::mitm::ldn {
             LogFormat("SetProtocol: refusing %u, only the NX protocol is emulated", protocol);
             return ResultProtocolUnsupported;
         }
+        return 0;
+    }
+
+    /*nyi*/
+    Result ICommunicationService::SetStationAcceptPolicy(u8 policy) {
+		AMS_UNUSED(policy);
+        return 0;
+    }
+
+    Result ICommunicationService::SetWirelessControllerRestriction() {
         return 0;
     }
 

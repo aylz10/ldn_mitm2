@@ -69,10 +69,10 @@ namespace ams::mitm::ldn {
             Result ScanPrivate(sf::Out<u32> count, sf::OutAutoSelectArray<NetworkInfo> buffer, u16 channel, ScanFilter filter);
             Result CreateNetworkPrivate(CreateNetworkPrivateConfig data, const sf::InPointerArray<AddressEntry> &entries);
             Result ConnectPrivate(ConnectPrivateParam param);
+            Result SetProtocol(u32 protocol);
 
             /*nyi----------------------------------------------------------------------------*/
             Result SetWirelessControllerRestriction();
-            Result SetProtocol(u32 protocol);
             Result Reject();
             Result AddAcceptFilterEntry();
             Result ClearAcceptFilter();

@@ -40,6 +40,9 @@ namespace ams::mitm::ldn {
         u32 ipv4;
     };
 
+    /* Relay Connect: NodeInfo then target bssid; a bare NodeInfo is also accepted. */
+    constexpr size_t RelayConnectPayloadSize = sizeof(NodeInfo) + sizeof(MacAddress);
+
     class LanStation : public Pollable {
         protected:
             friend class LANDiscovery;
@@ -106,8 +109,6 @@ namespace ams::mitm::ldn {
             LANDiscovery *discovery;
         public:
             std::unordered_map<MacAddress, NetworkInfo, MacHash> scanResults;
-            /* Guarded by discovery->dataMutex. */
-            u32 selfIp = 0;
         public:
             LDUdpSocket(int fd, LANDiscovery *discovery);
             int getFd() override {
@@ -148,13 +149,7 @@ namespace ams::mitm::ldn {
             void ping() { this->transport.SendPing(); }
             void sendScope(u32 token) { this->transport.SendScope(token); }
             bool pathDead() const { return this->transport.PathDead(); }
-            Result reopen() {
-                this->transport.Close();
-                return this->transport.Open();
-            }
-            int send(LANPacketType type, const void *data, size_t size) {
-                return this->sendPacket(type, data, size);
-            }
+            Result reopen() { return this->transport.Reopen(); }
     };
 
     class LANDiscovery {
@@ -175,7 +170,6 @@ namespace ams::mitm::ldn {
             friend class LDTcpSocket;
             friend class LanStation;
             friend class RelayLanSocket;
-            // 0: udp 1: tcp 2: client
             os::Mutex pollMutex;
             // Recursive: updateNodes() runs both with and without it held.
             // Lock order: pollMutex may be held when taking dataMutex, never the reverse.
@@ -193,6 +187,7 @@ namespace ams::mitm::ldn {
             bool initialized;
             NetworkInfo networkInfo;
             /* Guarded by dataMutex (through lastRelayAdvertise). */
+            u32 scanSelfIp = 0;
             MacAddress joinBssid{};
             bool joinActive = false;
             u16 relaySyncSeq = 0;
@@ -204,9 +199,9 @@ namespace ams::mitm::ldn {
             os::Tick lastRelayAdvertise = os::Tick(0);
             /* Worker thread only. */
             os::Tick lastRelayReconnect = os::Tick(0);
-            bool initRelay = false;
+            std::atomic<bool> initRelay{false};
             bool initListening = true;
-            bool needsReinit = false;
+            std::atomic<bool> needsReinit{false};
             Result refreshNetworkSession();
             u16 listenPort;
             os::ThreadType workerThread;
@@ -216,16 +211,21 @@ namespace ams::mitm::ldn {
             /* relaySeq 0 skips the staleness check (non-relay sync). */
             void onSyncNetwork(NetworkInfo *info, u16 relaySeq = 0);
             void onConnect(int new_fd);
-            void onRelayConnect(const NodeInfo *info);
+            void onRelayConnect(const NodeInfo *info, const MacAddress *targetBssid);
+            void addScanResult(const NetworkInfo *info);
+            /* Call with dataMutex held. */
+            LanStation *findRelayStation(u32 ipv4);
             void sendRelayBye();
             void sendRelayScope();
             void onDisconnectFromHost(DisconnectReason reason);
             void onNetworkInfoChanged();
+            void clearJoinState();
 
             void updateNodes();
             /* Call with dataMutex held. */
             void publishSessionRegistry();
             void resetStations();
+            void closeTcpAndStations();
             Result getFakeMac(MacAddress *mac);
             Result getNodeInfo(NodeInfo *node, const UserConfig *userConfig, u16 localCommunicationVersion);
             LanEventFunc lanEvent;
@@ -239,7 +239,7 @@ namespace ams::mitm::ldn {
             Result createNetwork(const SecurityConfig *securityConfig, const UserConfig *userConfig, const NetworkConfig *networkConfig);
             Result createNetworkPrivate(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig);
             Result destroyNetwork();
-            Result connect(const NetworkInfo *networkInfo, UserConfig *userConfig, u16 localCommunicationVersion);
+            Result connect(const NetworkInfo *networkInfo, const UserConfig *userConfig, u16 localCommunicationVersion);
             Result connectPrivate(const SecurityParameterData *securityParameter, const UserConfig *userConfig, u16 localCommunicationVersion, const NetworkConfig *networkConfig);
             Result disconnect();
             Result getNetworkInfo(NetworkInfo *pOutNetwork);
